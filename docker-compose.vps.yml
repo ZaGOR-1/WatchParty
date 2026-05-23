@@ -1,0 +1,58 @@
+services:
+  server:
+    build:
+      context: ./server
+    container_name: watch-party-server
+    env_file:
+      - ./.env
+    environment:
+      - PORT=4000
+    expose:
+      - "4000"
+    restart: unless-stopped
+
+  client-build:
+    build:
+      context: ./client
+      target: export
+    container_name: watch-party-client-build
+    volumes:
+      - frontend_dist:/out
+    command: sh -c "rm -rf /out/* && cp -r /app/dist/. /out"
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: watch-party-nginx
+    depends_on:
+      server:
+        condition: service_started
+      client-build:
+        condition: service_completed_successfully
+    expose:
+      - "80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - frontend_dist:/usr/share/nginx/html:ro
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: watch-party-caddy
+    depends_on:
+      nginx:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN:-watch.hotzagor.tech}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+
+volumes:
+  frontend_dist:
+  caddy_data:
+  caddy_config:

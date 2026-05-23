@@ -1,0 +1,337 @@
+@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap");
+
+:root {
+  --bg-main: #070b12;
+  --bg-panel: rgba(13, 19, 30, 0.86);
+  --bg-panel-strong: #10192a;
+  --text-main: #e7edf7;
+  --text-muted: #9fb0cb;
+  --accent: #2ec4b6;
+  --accent-strong: #18a698;
+  --danger: #ff6b6b;
+  --border: rgba(168, 188, 220, 0.18);
+  --shadow: 0 30px 70px rgba(2, 6, 15, 0.55);
+  --radius-lg: 22px;
+  --radius-md: 14px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: "Manrope", "Segoe UI", sans-serif;
+  color: var(--text-main);
+  background:
+    radial-gradient(1200px 600px at 7% -10%, #144e4f 0%, rgba(20, 78, 79, 0) 60%),
+    radial-gradient(900px 450px at 95% 0%, #54392a 0%, rgba(84, 57, 42, 0) 62%),
+    linear-gradient(140deg, #060910 0%, #0b1220 45%, #060910 100%);
+}
+
+a {
+  color: inherit;
+}
+
+.page {
+  width: min(1100px, 92vw);
+  margin: 0 auto;
+  padding: 32px 0 42px;
+}
+
+.page-home {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+}
+
+.panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-panel);
+  backdrop-filter: blur(10px);
+  box-shadow: var(--shadow);
+}
+
+.hero-panel {
+  width: min(760px, 100%);
+  padding: 34px 32px;
+}
+
+.eyebrow {
+  margin: 0;
+  color: var(--accent);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 12px;
+}
+
+h1 {
+  margin: 10px 0 10px;
+  font-family: "Space Grotesk", "Manrope", sans-serif;
+  font-size: clamp(30px, 5.4vw, 48px);
+  line-height: 1.08;
+}
+
+.subtitle {
+  margin: 0 0 22px;
+  color: var(--text-muted);
+  max-width: 62ch;
+}
+
+.create-room-form {
+  display: grid;
+  gap: 10px;
+}
+
+.create-room-form label {
+  font-size: 14px;
+  color: var(--text-muted);
+}
+
+input {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: rgba(11, 16, 25, 0.94);
+  color: var(--text-main);
+  padding: 13px 14px;
+  font-size: 15px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+input:focus {
+  outline: none;
+  border-color: rgba(46, 196, 182, 0.8);
+  box-shadow: 0 0 0 3px rgba(46, 196, 182, 0.16);
+}
+
+button,
+.ghost-button {
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--accent);
+  color: #001516;
+  padding: 12px 16px;
+  font-weight: 700;
+  font-size: 15px;
+  cursor: pointer;
+  text-decoration: none;
+  transition: transform 0.18s ease, background-color 0.18s ease, box-shadow 0.18s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+}
+
+button:hover,
+.ghost-button:hover {
+  transform: translateY(-1px);
+  background: var(--accent-strong);
+  box-shadow: 0 10px 20px rgba(24, 166, 152, 0.26);
+}
+
+button:disabled {
+  opacity: 0.7;
+  cursor: wait;
+  transform: none;
+  box-shadow: none;
+}
+
+.support-note {
+  margin-top: 18px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(46, 196, 182, 0.35);
+  background: rgba(46, 196, 182, 0.09);
+  color: #bdeee8;
+}
+
+.page-room {
+  display: grid;
+  gap: 18px;
+}
+
+.room-panel,
+.video-panel {
+  padding: 20px;
+}
+
+.room-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+  margin-bottom: 14px;
+}
+
+.room-head h1 {
+  margin: 4px 0 0;
+  font-size: clamp(24px, 3.5vw, 36px);
+}
+
+.connection-pill {
+  border-radius: 999px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.connection-pill.online {
+  color: #b9f8ef;
+  border: 1px solid rgba(46, 196, 182, 0.45);
+  background: rgba(46, 196, 182, 0.14);
+}
+
+.connection-pill.offline {
+  color: #ffd0d0;
+  border: 1px solid rgba(255, 107, 107, 0.4);
+  background: rgba(255, 107, 107, 0.13);
+}
+
+.room-link-block {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+}
+
+.room-stats {
+  margin-top: 12px;
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+.room-actions {
+  margin-top: 14px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.ghost-button {
+  background: transparent;
+  border: 1px solid rgba(159, 176, 203, 0.5);
+  color: #cdd8ee;
+}
+
+.ghost-button:hover {
+  border-color: rgba(46, 196, 182, 0.7);
+  color: #dcf4f1;
+  background: rgba(46, 196, 182, 0.1);
+}
+
+.info-message,
+.error-message {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  font-size: 14px;
+}
+
+.info-message {
+  color: #bdeee8;
+  border: 1px solid rgba(46, 196, 182, 0.35);
+  background: rgba(46, 196, 182, 0.12);
+}
+
+.error-message {
+  color: #ffd3d3;
+  border: 1px solid rgba(255, 107, 107, 0.38);
+  background: rgba(255, 107, 107, 0.14);
+}
+
+.error-message p {
+  margin: 0;
+}
+
+.error-details {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: #ffdede;
+  font-size: 13px;
+}
+
+.error-details li {
+  margin-bottom: 3px;
+}
+
+.loading-panel {
+  padding: 24px;
+}
+
+.player-frame {
+  width: 100%;
+  border-radius: 18px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: #040609;
+  aspect-ratio: 16 / 9;
+  box-shadow: inset 0 0 0 1px rgba(121, 141, 170, 0.16);
+}
+
+.player-video,
+.player-youtube,
+.player-frame iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+}
+
+.unsupported-message {
+  display: grid;
+  place-items: center;
+  min-height: 200px;
+  border-radius: 14px;
+  border: 1px dashed rgba(255, 107, 107, 0.45);
+  color: #ffc6c6;
+  text-align: center;
+  padding: 20px;
+}
+
+@media (max-width: 760px) {
+  .page {
+    width: min(1100px, 95vw);
+    padding: 18px 0 26px;
+  }
+
+  .hero-panel {
+    padding: 22px 18px;
+  }
+
+  .room-panel,
+  .video-panel {
+    padding: 14px;
+  }
+
+  .room-link-block {
+    grid-template-columns: 1fr;
+  }
+
+  .room-head {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .room-actions {
+    width: 100%;
+  }
+
+  .room-actions button,
+  .room-actions .ghost-button {
+    width: 100%;
+  }
+}

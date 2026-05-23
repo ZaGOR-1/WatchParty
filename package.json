@@ -1,0 +1,17 @@
+{
+  "name": "watch-party-workspace",
+  "private": true,
+  "scripts": {
+    "install:all": "npm install --prefix server && npm install --prefix client",
+    "stop:dev": "node ./scripts/stop-dev-ports.js",
+    "dev:server": "node ./server/node_modules/nodemon/bin/nodemon.js --watch ./server/src ./server/src/index.js",
+    "dev:client": "node ./client/node_modules/vite/bin/vite.js ./client --config ./client/vite.config.js --host --port 5173",
+    "dev": "concurrently -k -n server,client -c blue,green \"node ./server/node_modules/nodemon/bin/nodemon.js --watch ./server/src ./server/src/index.js\" \"node ./client/node_modules/vite/bin/vite.js ./client --config ./client/vite.config.js --host --port 5173\"",
+    "dev:fresh": "npm run stop:dev && npm run dev",
+    "build": "npm run build --prefix client",
+    "start": "npm run start --prefix server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.0"
+  }
+}

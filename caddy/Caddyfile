@@ -1,0 +1,5 @@
+{$DOMAIN:watch.hotzagor.tech} {
+    encode zstd gzip
+    reverse_proxy nginx:80
+}
+
