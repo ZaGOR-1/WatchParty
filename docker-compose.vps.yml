@@ -45,8 +45,8 @@ services:
         condition: service_started
       client-build:
         condition: service_completed_successfully
-    expose:
-      - "80"
+    ports:
+      - "127.0.0.1:8081:80"
     volumes:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
       - frontend_dist:/usr/share/nginx/html:ro
