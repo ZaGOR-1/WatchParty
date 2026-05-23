@@ -44,7 +44,7 @@ function loadYoutubeApi() {
 }
 
 const YoutubePlayer = forwardRef(function YoutubePlayer(
-  { videoId, ignoreEventsRef, onPlay, onPause, onSeek, onReady, onError },
+  { videoId, ignoreEventsRef, onPlay, onPause, onSeek, onEnded, onReady, onError },
   ref
 ) {
   const elementId = useMemo(
@@ -160,6 +160,8 @@ const YoutubePlayer = forwardRef(function YoutubePlayer(
                 onPlay?.(currentTime);
               } else if (event.data === window.YT.PlayerState.PAUSED) {
                 onPause?.(currentTime);
+              } else if (event.data === window.YT.PlayerState.ENDED) {
+                onEnded?.();
               }
             },
             onError: (event) => {
@@ -222,7 +224,7 @@ const YoutubePlayer = forwardRef(function YoutubePlayer(
         playerRef.current = null;
       }
     };
-  }, [elementId, videoId, ignoreEventsRef, onPlay, onPause, onSeek, onReady, onError]);
+  }, [elementId, videoId, ignoreEventsRef, onPlay, onPause, onSeek, onEnded, onReady, onError]);
 
   return (
     <div className="player-frame">

@@ -9,12 +9,14 @@ export function getSocket() {
     socket = io(socketUrl, {
       autoConnect: false,
       reconnection: true,
-      reconnectionAttempts: 8,
+      reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      randomizationFactor: 0.5,
+      timeout: 10000,
       path: "/socket.io",
     });
   }
 
   return socket;
 }
-

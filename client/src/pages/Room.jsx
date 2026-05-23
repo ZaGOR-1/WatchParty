@@ -2,16 +2,78 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import VideoPlayer from "../components/VideoPlayer";
 import { getSocket } from "../socket";
+import { parseVideoUrl } from "../utils/videoParser";
 
-const REMOTE_ACTION_LOCK_MS = 1200;
+const REMOTE_ACTION_LOCK_MS = 1000;
 const AUTO_SYNC_INTERVAL_MS = 7000;
-const DRIFT_THRESHOLD_SEC = 1.25;
+const CLOCK_SYNC_INTERVAL_MS = 25000;
+const CLOCK_SYNC_TIMEOUT_MS = 2500;
+const CLOCK_SYNC_ATTEMPTS = 4;
+const MAX_ACCEPTABLE_RTT_MS = 2200;
+const MAX_CLOCK_SAMPLES = 12;
+const BEST_CLOCK_SAMPLES = 4;
+const HARD_DRIFT_THRESHOLD_SEC = 1.35;
+const SOFT_DRIFT_THRESHOLD_SEC = 0.55;
+const DRIFT_CORRECTION_COOLDOWN_MS = 4000;
+const RECONNECT_RESYNC_DELAY_MS = 500;
+const RECONNECT_RETRY_PULSE_MS = 5000;
+const NICKNAME_STORAGE_KEY = "watchparty:nickname";
+const MAX_NICKNAME_LENGTH = 24;
+const PLAYLIST_MAX_ITEMS = 50;
+
+function sanitizeNickname(value) {
+  const trimmed = String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!trimmed) {
+    return "";
+  }
+
+  return trimmed.slice(0, MAX_NICKNAME_LENGTH);
+}
+
+function getStoredNickname() {
+  if (typeof window === "undefined") {
+    return "";
+  }
+
+  return sanitizeNickname(window.localStorage.getItem(NICKNAME_STORAGE_KEY) || "");
+}
+
+function formatDisconnectReason(reason) {
+  if (reason === "ping timeout") {
+    return "Таймаут ping/pong";
+  }
+
+  if (reason === "transport close") {
+    return "Мережа тимчасово недоступна";
+  }
+
+  if (reason === "transport error") {
+    return "Помилка транспортного каналу";
+  }
+
+  if (reason === "io server disconnect") {
+    return "Сервер закрив сесію";
+  }
+
+  if (reason === "io client disconnect") {
+    return "Зʼєднання закрито локально";
+  }
+
+  return "Невідома причина";
+}
 
 function Room() {
   const { roomId } = useParams();
   const [loading, setLoading] = useState(true);
   const [roomState, setRoomState] = useState(null);
   const [usersCount, setUsersCount] = useState(0);
+  const [participants, setParticipants] = useState([]);
+  const [nickname, setNickname] = useState(() => getStoredNickname());
+  const [nicknameDraft, setNicknameDraft] = useState(() => getStoredNickname());
+  const [playlistUrlDraft, setPlaylistUrlDraft] = useState("");
   const [connectionStatus, setConnectionStatus] = useState("connecting");
   const [error, setError] = useState("");
   const [infoMessage, setInfoMessage] = useState("");
@@ -19,17 +81,85 @@ function Room() {
   const playerRef = useRef(null);
   const socketRef = useRef(null);
   const roomStateRef = useRef(null);
+  const nicknameRef = useRef(nickname);
   const ignoreNextEventRef = useRef(false);
   const infoTimeoutRef = useRef(null);
+  const reconnectResyncTimeoutRef = useRef(null);
+  const hasConnectedOnceRef = useRef(false);
+  const lastDisconnectReasonRef = useRef(null);
+  const driftCorrectionAtRef = useRef(0);
+  const serverClockRef = useRef({
+    offsetMs: 0,
+    lastRttMs: null,
+    syncedAt: 0,
+    samples: [],
+  });
 
   const roomUrl = useMemo(
     () => `${window.location.origin}/room/${roomId}`,
     [roomId]
   );
+  const sortedParticipants = useMemo(() => {
+    return [...participants].sort((left, right) => {
+      const leftJoined = Number(left?.joinedAt || 0);
+      const rightJoined = Number(right?.joinedAt || 0);
+      return leftJoined - rightJoined;
+    });
+  }, [participants]);
+  const playlist = useMemo(() => {
+    return Array.isArray(roomState?.playlist) ? roomState.playlist : [];
+  }, [roomState?.playlist]);
+  const currentPlaylistIndex = useMemo(() => {
+    const parsed = Number(roomState?.currentIndex);
+
+    if (!Number.isInteger(parsed)) {
+      return 0;
+    }
+
+    if (playlist.length === 0) {
+      return 0;
+    }
+
+    if (parsed < 0) {
+      return 0;
+    }
+
+    if (parsed >= playlist.length) {
+      return playlist.length - 1;
+    }
+
+    return parsed;
+  }, [roomState?.currentIndex, playlist]);
+  const currentPlaylistItem = useMemo(() => {
+    if (!playlist.length) {
+      return null;
+    }
+
+    return playlist[currentPlaylistIndex] || playlist[0];
+  }, [currentPlaylistIndex, playlist]);
 
   useEffect(() => {
     roomStateRef.current = roomState;
   }, [roomState]);
+
+  useEffect(() => {
+    nicknameRef.current = nickname;
+  }, [nickname]);
+
+  const normalizeTime = useCallback((value) => {
+    const parsed = Number(value);
+
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      return 0;
+    }
+
+    return parsed;
+  }, []);
+
+  const estimateServerNowMs = useCallback(
+    () => Date.now() + serverClockRef.current.offsetMs,
+    []
+  );
 
   const showInfo = useCallback((message) => {
     setInfoMessage(message);
@@ -45,30 +175,242 @@ function Room() {
     }, REMOTE_ACTION_LOCK_MS);
   }, []);
 
+  const updateClockEstimate = useCallback((offsetMs, rttMs) => {
+    if (!Number.isFinite(offsetMs) || !Number.isFinite(rttMs)) {
+      return;
+    }
+
+    if (rttMs > MAX_ACCEPTABLE_RTT_MS) {
+      return;
+    }
+
+    const state = serverClockRef.current;
+    state.samples.push({ offsetMs, rttMs });
+
+    if (state.samples.length > MAX_CLOCK_SAMPLES) {
+      state.samples.shift();
+    }
+
+    const bestSamples = [...state.samples]
+      .sort((left, right) => left.rttMs - right.rttMs)
+      .slice(0, BEST_CLOCK_SAMPLES);
+
+    let weightedOffsetSum = 0;
+    let weightSum = 0;
+
+    for (const sample of bestSamples) {
+      const weight = 1 / Math.max(sample.rttMs, 1);
+      weightedOffsetSum += sample.offsetMs * weight;
+      weightSum += weight;
+    }
+
+    if (weightSum > 0) {
+      state.offsetMs = weightedOffsetSum / weightSum;
+      state.lastRttMs = rttMs;
+      state.syncedAt = Date.now();
+    }
+  }, []);
+
+  const requestClockSample = useCallback((socket) => {
+    return new Promise((resolve) => {
+      const clientSentAt = Date.now();
+      let finished = false;
+
+      const timeout = window.setTimeout(() => {
+        if (finished) {
+          return;
+        }
+
+        finished = true;
+        resolve(null);
+      }, CLOCK_SYNC_TIMEOUT_MS);
+
+      socket.emit("timeSync", { clientSentAt }, (payload) => {
+        if (finished) {
+          return;
+        }
+
+        finished = true;
+        window.clearTimeout(timeout);
+
+        const serverNowMs = Number(payload?.serverNowMs);
+        if (!Number.isFinite(serverNowMs)) {
+          resolve(null);
+          return;
+        }
+
+        const clientReceivedAt = Date.now();
+        const rttMs = clientReceivedAt - clientSentAt;
+        const midpointMs = clientSentAt + rttMs / 2;
+        const offsetMs = serverNowMs - midpointMs;
+
+        resolve({
+          offsetMs,
+          rttMs,
+        });
+      });
+    });
+  }, []);
+
+  const syncServerClock = useCallback(
+    async ({ attempts = CLOCK_SYNC_ATTEMPTS } = {}) => {
+      const socket = socketRef.current;
+
+      if (!socket || !socket.connected) {
+        return;
+      }
+
+      for (let sampleIndex = 0; sampleIndex < attempts; sampleIndex += 1) {
+        const sample = await requestClockSample(socket);
+
+        if (sample) {
+          updateClockEstimate(sample.offsetMs, sample.rttMs);
+        }
+      }
+    },
+    [requestClockSample, updateClockEstimate]
+  );
+
+  const consumeServerNowHint = useCallback((payload) => {
+    const serverNowMs = Number(payload?.serverNowMs);
+
+    if (!Number.isFinite(serverNowMs)) {
+      return;
+    }
+
+    const coarseOffsetMs = serverNowMs - Date.now();
+    updateClockEstimate(coarseOffsetMs, MAX_ACCEPTABLE_RTT_MS);
+  }, [updateClockEstimate]);
+
+  const resolveExpectedTime = useCallback(
+    (snapshot) => {
+      if (!snapshot) {
+        return 0;
+      }
+
+      const stateCurrentTime = Number(snapshot.stateCurrentTime);
+      const stateUpdatedAt = Number(snapshot.stateUpdatedAt);
+      const hasPreciseState =
+        Number.isFinite(stateCurrentTime) && Number.isFinite(stateUpdatedAt);
+
+      if (hasPreciseState) {
+        const baseTime = normalizeTime(stateCurrentTime);
+
+        if (!snapshot.isPlaying) {
+          return baseTime;
+        }
+
+        const elapsedSec = Math.max(0, (estimateServerNowMs() - stateUpdatedAt) / 1000);
+        return normalizeTime(baseTime + elapsedSec);
+      }
+
+      return normalizeTime(snapshot.currentTime);
+    },
+    [estimateServerNowMs, normalizeTime]
+  );
+
+  const updateRoomStateFromSnapshot = useCallback(
+    (snapshot, fallbackIsPlaying) => {
+      const isPlaying =
+        typeof snapshot.isPlaying === "boolean" ? snapshot.isPlaying : fallbackIsPlaying;
+      const expectedTime = resolveExpectedTime({
+        ...snapshot,
+        isPlaying,
+      });
+
+      setRoomState((prev) => {
+        if (!prev) {
+          return prev;
+        }
+
+        return {
+          ...prev,
+          isPlaying,
+          currentTime: expectedTime,
+          stateCurrentTime: Number.isFinite(Number(snapshot.stateCurrentTime))
+            ? Number(snapshot.stateCurrentTime)
+            : expectedTime,
+          updatedAt: Number.isFinite(Number(snapshot.updatedAt))
+            ? Number(snapshot.updatedAt)
+            : prev.updatedAt,
+          stateUpdatedAt: Number.isFinite(Number(snapshot.stateUpdatedAt))
+            ? Number(snapshot.stateUpdatedAt)
+            : Number.isFinite(Number(snapshot.updatedAt))
+              ? Number(snapshot.updatedAt)
+              : prev.stateUpdatedAt,
+          serverNowMs: Number.isFinite(Number(snapshot.serverNowMs))
+            ? Number(snapshot.serverNowMs)
+            : prev.serverNowMs,
+        };
+      });
+    },
+    [resolveExpectedTime]
+  );
+
   const applySnapshotToPlayer = useCallback(
-    (snapshot, forceSeek = false) => {
+    (snapshot, { forceSeek = false, allowSoftCorrection = false } = {}) => {
       if (!snapshot || !playerRef.current) {
         return;
       }
 
+      const targetTime = resolveExpectedTime(snapshot);
+
       withRemoteLock(() => {
         const player = playerRef.current;
         const localTime = Number(player.getCurrentTime?.() || 0);
-        const targetTime = Number(snapshot.currentTime || 0);
-        const drift = Math.abs(localTime - targetTime);
+        const driftSec = Math.abs(localTime - targetTime);
+        const nowMs = Date.now();
+        const correctionCooldownPassed =
+          nowMs - driftCorrectionAtRef.current > DRIFT_CORRECTION_COOLDOWN_MS;
+        const shouldHardSeek = forceSeek || driftSec >= HARD_DRIFT_THRESHOLD_SEC;
+        const shouldSoftCorrect =
+          allowSoftCorrection &&
+          snapshot.isPlaying &&
+          driftSec >= SOFT_DRIFT_THRESHOLD_SEC &&
+          correctionCooldownPassed;
 
-        if (forceSeek || drift > DRIFT_THRESHOLD_SEC) {
+        if (shouldHardSeek || shouldSoftCorrect) {
           player.seekTo?.(targetTime);
+          driftCorrectionAtRef.current = nowMs;
         }
 
         if (snapshot.isPlaying) {
-          player.play?.(targetTime);
-        } else {
+          if (shouldHardSeek || shouldSoftCorrect) {
+            player.play?.(targetTime);
+          } else {
+            player.play?.();
+          }
+          return;
+        }
+
+        if (shouldHardSeek || shouldSoftCorrect) {
           player.pause?.(targetTime);
+        } else {
+          player.pause?.();
         }
       });
     },
-    [withRemoteLock]
+    [resolveExpectedTime, withRemoteLock]
+  );
+
+  const applyRoomMetaSnapshot = useCallback((snapshot) => {
+    setRoomState(snapshot);
+    setUsersCount(snapshot.usersCount || 0);
+    setParticipants(Array.isArray(snapshot.participants) ? snapshot.participants : []);
+  }, []);
+
+  const scheduleReconnectResync = useCallback(
+    (socket) => {
+      window.clearTimeout(reconnectResyncTimeoutRef.current);
+      reconnectResyncTimeoutRef.current = window.setTimeout(() => {
+        if (!socket.connected) {
+          return;
+        }
+
+        socket.emit("syncRequest", { roomId, reason: "reconnect" });
+      }, RECONNECT_RESYNC_DELAY_MS);
+    },
+    [roomId]
   );
 
   useEffect(() => {
@@ -92,6 +434,7 @@ function Room() {
 
         setRoomState(data);
         setUsersCount(data.usersCount || 0);
+        setParticipants(Array.isArray(data.participants) ? data.participants : []);
       } catch (requestError) {
         if (!canceled) {
           setError(requestError.message || "Помилка завантаження кімнати.");
@@ -112,104 +455,183 @@ function Room() {
 
   useEffect(() => {
     const socket = getSocket();
+    const manager = socket.io;
     socketRef.current = socket;
 
     const handleConnect = () => {
+      const isReconnect = hasConnectedOnceRef.current;
+      const recovered = Boolean(socket.recovered);
+
+      hasConnectedOnceRef.current = true;
+      lastDisconnectReasonRef.current = null;
       setConnectionStatus("connected");
-      socket.emit("joinRoom", { roomId });
+      setError("");
+      socket.emit("joinRoom", {
+        roomId,
+        nickname: sanitizeNickname(nicknameRef.current),
+      });
+
+      void syncServerClock({
+        attempts: isReconnect ? 2 : CLOCK_SYNC_ATTEMPTS,
+      });
+
+      if (isReconnect) {
+        scheduleReconnectResync(socket);
+        showInfo(
+          recovered
+            ? "Зʼєднання відновлено. Пропущені події підвантажено, виконуємо контрольну синхронізацію."
+            : "Зʼєднання відновлено. Синхронізуємо актуальний стан кімнати."
+        );
+      }
     };
 
-    const handleDisconnect = () => {
+    const handleDisconnect = (reason) => {
+      lastDisconnectReasonRef.current = reason || null;
+      window.clearTimeout(reconnectResyncTimeoutRef.current);
+
+      if (reason === "io client disconnect") {
+        setConnectionStatus("disconnected");
+        return;
+      }
+
+      if (socket.active) {
+        setConnectionStatus("reconnecting");
+        showInfo(`Зʼєднання втрачено: ${formatDisconnectReason(reason)}. Відновлюємо...`);
+        return;
+      }
+
       setConnectionStatus("disconnected");
+      setError(
+        `Втрачено зʼєднання (${formatDisconnectReason(
+          reason
+        )}). Перевірте мережу та натисніть "Синхронізуватися з хостом".`
+      );
     };
 
     const handleRoomState = (snapshot) => {
-      setRoomState(snapshot);
-      setUsersCount(snapshot.usersCount || 0);
-      applySnapshotToPlayer(snapshot, true);
+      consumeServerNowHint(snapshot);
+      applyRoomMetaSnapshot(snapshot);
+
+      const ownParticipant = Array.isArray(snapshot.participants)
+        ? snapshot.participants.find((participant) => participant.socketId === socket.id)
+        : null;
+
+      if (ownParticipant?.nickname) {
+        setNickname(ownParticipant.nickname);
+        setNicknameDraft(ownParticipant.nickname);
+        window.localStorage.setItem(NICKNAME_STORAGE_KEY, ownParticipant.nickname);
+      }
+
+      applySnapshotToPlayer(snapshot, { forceSeek: true });
     };
 
     const handlePlay = (payload) => {
-      setRoomState((prev) =>
-        prev
-          ? {
-              ...prev,
-              isPlaying: true,
-              currentTime: payload.currentTime,
-              updatedAt: Date.now(),
-            }
-          : prev
-      );
-
+      consumeServerNowHint(payload);
+      updateRoomStateFromSnapshot(payload, true);
       applySnapshotToPlayer(
         {
-          currentTime: payload.currentTime,
+          ...payload,
           isPlaying: true,
         },
-        true
+        { forceSeek: true }
       );
     };
 
     const handlePause = (payload) => {
-      setRoomState((prev) =>
-        prev
-          ? {
-              ...prev,
-              isPlaying: false,
-              currentTime: payload.currentTime,
-              updatedAt: Date.now(),
-            }
-          : prev
-      );
-
+      consumeServerNowHint(payload);
+      updateRoomStateFromSnapshot(payload, false);
       applySnapshotToPlayer(
         {
-          currentTime: payload.currentTime,
+          ...payload,
           isPlaying: false,
         },
-        true
+        { forceSeek: true }
       );
     };
 
     const handleSeek = (payload) => {
+      consumeServerNowHint(payload);
+
       const isPlaying =
         typeof payload.isPlaying === "boolean"
           ? payload.isPlaying
           : roomStateRef.current?.isPlaying || false;
 
-      setRoomState((prev) =>
-        prev
-          ? {
-              ...prev,
-              isPlaying,
-              currentTime: payload.currentTime,
-              updatedAt: Date.now(),
-            }
-          : prev
-      );
-
+      updateRoomStateFromSnapshot(payload, isPlaying);
       applySnapshotToPlayer(
         {
-          currentTime: payload.currentTime,
+          ...payload,
           isPlaying,
         },
-        true
+        { forceSeek: true }
       );
     };
 
     const handleSyncResponse = (snapshot) => {
-      setRoomState(snapshot);
-      setUsersCount(snapshot.usersCount || 0);
-      applySnapshotToPlayer(snapshot, true);
-      showInfo("Синхронізація виконана");
+      consumeServerNowHint(snapshot);
+
+      const isManual = snapshot.reason === "manual";
+      applyRoomMetaSnapshot(snapshot);
+      applySnapshotToPlayer(snapshot, {
+        forceSeek: isManual,
+        allowSoftCorrection: !isManual,
+      });
+
+      if (isManual) {
+        showInfo("Синхронізація виконана");
+      }
     };
 
-    const handleUserJoined = ({ usersCount: count }) => {
-      setUsersCount(count || 0);
+    const handlePlaylistUpdated = (snapshot) => {
+      consumeServerNowHint(snapshot);
+      const previousItemId = roomStateRef.current?.currentItem?.itemId || null;
+      const nextItemId = snapshot?.currentItem?.itemId || null;
+      const shouldReapplyToPlayer =
+        previousItemId !== nextItemId || snapshot.action === "selected";
+
+      applyRoomMetaSnapshot(snapshot);
+
+      if (shouldReapplyToPlayer) {
+        applySnapshotToPlayer(snapshot, { forceSeek: true });
+      }
+
+      if (snapshot.action === "added") {
+        showInfo("Відео додано у плейлист");
+      } else if (snapshot.action === "removed") {
+        showInfo("Відео видалено з плейлиста");
+      } else if (snapshot.action === "selected") {
+        showInfo("Перемкнуто на інше відео");
+      }
     };
 
-    const handleUserLeft = ({ usersCount: count }) => {
+    const handlePlaylistAdvanced = (snapshot) => {
+      consumeServerNowHint(snapshot);
+      applyRoomMetaSnapshot(snapshot);
+      applySnapshotToPlayer(snapshot, { forceSeek: true });
+
+      if (snapshot.reason === "auto_next") {
+        showInfo("Автоперехід на наступне відео");
+      } else if (snapshot.reason === "playlist_finished") {
+        showInfo("Плейлист завершено");
+      }
+    };
+
+    const handleUserJoined = ({ usersCount: count, participants: list, nickname: joined }) => {
       setUsersCount(count || 0);
+      setParticipants(Array.isArray(list) ? list : []);
+
+      if (joined) {
+        showInfo(`${joined} приєднався до кімнати`);
+      }
+    };
+
+    const handleUserLeft = ({ usersCount: count, participants: list, nickname: left }) => {
+      setUsersCount(count || 0);
+      setParticipants(Array.isArray(list) ? list : []);
+
+      if (left) {
+        showInfo(`${left} вийшов з кімнати`);
+      }
     };
 
     const handleRoomError = ({ message }) => {
@@ -217,8 +639,36 @@ function Room() {
     };
 
     const handleConnectError = (connectionError) => {
+      if (socket.active) {
+        setConnectionStatus("reconnecting");
+        return;
+      }
+
       setConnectionStatus("disconnected");
-      setError(connectionError.message || "Втрачено з’єднання із сервером.");
+      setError(connectionError.message || "Не вдалося підключитися до сервера.");
+    };
+
+    const handleReconnectAttempt = (attempt) => {
+      setConnectionStatus("reconnecting");
+
+      if (attempt === 1) {
+        showInfo("Пробуємо відновити зʼєднання...");
+      }
+    };
+
+    const handleReconnect = () => {
+      setConnectionStatus("connected");
+    };
+
+    const handleReconnectError = () => {
+      setConnectionStatus("reconnecting");
+    };
+
+    const handleReconnectFailed = () => {
+      setConnectionStatus("disconnected");
+      setError(
+        "Автовідновлення зʼєднання не вдалося. Перевірте інтернет і натисніть \"Синхронізуватися з хостом\"."
+      );
     };
 
     socket.on("connect", handleConnect);
@@ -228,10 +678,32 @@ function Room() {
     socket.on("pause", handlePause);
     socket.on("seek", handleSeek);
     socket.on("syncResponse", handleSyncResponse);
+    socket.on("playlistUpdated", handlePlaylistUpdated);
+    socket.on("playlistAdvanced", handlePlaylistAdvanced);
     socket.on("userJoined", handleUserJoined);
     socket.on("userLeft", handleUserLeft);
     socket.on("roomError", handleRoomError);
     socket.on("connect_error", handleConnectError);
+    manager.on("reconnect_attempt", handleReconnectAttempt);
+    manager.on("reconnect", handleReconnect);
+    manager.on("reconnect_error", handleReconnectError);
+    manager.on("reconnect_failed", handleReconnectFailed);
+
+    const reconnectPulseTimer = window.setInterval(() => {
+      if (socket.connected || socket.active) {
+        return;
+      }
+
+      const reason = lastDisconnectReasonRef.current;
+      const shouldRetryManually =
+        reason === "transport close" || reason === "transport error" || reason === "ping timeout";
+
+      if (!shouldRetryManually) {
+        return;
+      }
+
+      socket.connect();
+    }, RECONNECT_RETRY_PULSE_MS);
 
     if (!socket.connected) {
       socket.connect();
@@ -241,6 +713,8 @@ function Room() {
 
     return () => {
       window.clearTimeout(infoTimeoutRef.current);
+      window.clearTimeout(reconnectResyncTimeoutRef.current);
+      window.clearInterval(reconnectPulseTimer);
       socket.off("connect", handleConnect);
       socket.off("disconnect", handleDisconnect);
       socket.off("roomState", handleRoomState);
@@ -248,13 +722,28 @@ function Room() {
       socket.off("pause", handlePause);
       socket.off("seek", handleSeek);
       socket.off("syncResponse", handleSyncResponse);
+      socket.off("playlistUpdated", handlePlaylistUpdated);
+      socket.off("playlistAdvanced", handlePlaylistAdvanced);
       socket.off("userJoined", handleUserJoined);
       socket.off("userLeft", handleUserLeft);
       socket.off("roomError", handleRoomError);
       socket.off("connect_error", handleConnectError);
+      manager.off("reconnect_attempt", handleReconnectAttempt);
+      manager.off("reconnect", handleReconnect);
+      manager.off("reconnect_error", handleReconnectError);
+      manager.off("reconnect_failed", handleReconnectFailed);
       socket.disconnect();
     };
-  }, [roomId, applySnapshotToPlayer, showInfo]);
+  }, [
+    roomId,
+    applySnapshotToPlayer,
+    applyRoomMetaSnapshot,
+    consumeServerNowHint,
+    scheduleReconnectResync,
+    showInfo,
+    syncServerClock,
+    updateRoomStateFromSnapshot,
+  ]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -263,25 +752,39 @@ function Room() {
         return;
       }
 
-      socket.emit("syncRequest", { roomId });
+      socket.emit("syncRequest", { roomId, reason: "periodic" });
     }, AUTO_SYNC_INTERVAL_MS);
 
     return () => window.clearInterval(timer);
   }, [roomId]);
 
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void syncServerClock({ attempts: 1 });
+    }, CLOCK_SYNC_INTERVAL_MS);
+
+    return () => window.clearInterval(timer);
+  }, [syncServerClock]);
+
   const emitSocketEvent = useCallback((eventName, payload) => {
     const socket = socketRef.current;
 
     if (!socket || !socket.connected) {
-      return;
+      return false;
     }
 
     socket.emit(eventName, payload);
+    return true;
   }, []);
 
   const handleLocalPlay = useCallback(
     (currentTime) => {
       if (ignoreNextEventRef.current) {
+        return;
+      }
+
+      const sent = emitSocketEvent("play", { roomId, currentTime });
+      if (!sent) {
         return;
       }
 
@@ -291,19 +794,24 @@ function Room() {
               ...prev,
               isPlaying: true,
               currentTime,
-              updatedAt: Date.now(),
+              stateCurrentTime: currentTime,
+              updatedAt: estimateServerNowMs(),
+              stateUpdatedAt: estimateServerNowMs(),
             }
           : prev
       );
-
-      emitSocketEvent("play", { roomId, currentTime });
     },
-    [emitSocketEvent, roomId]
+    [emitSocketEvent, estimateServerNowMs, roomId]
   );
 
   const handleLocalPause = useCallback(
     (currentTime) => {
       if (ignoreNextEventRef.current) {
+        return;
+      }
+
+      const sent = emitSocketEvent("pause", { roomId, currentTime });
+      if (!sent) {
         return;
       }
 
@@ -313,14 +821,14 @@ function Room() {
               ...prev,
               isPlaying: false,
               currentTime,
-              updatedAt: Date.now(),
+              stateCurrentTime: currentTime,
+              updatedAt: estimateServerNowMs(),
+              stateUpdatedAt: estimateServerNowMs(),
             }
           : prev
       );
-
-      emitSocketEvent("pause", { roomId, currentTime });
     },
-    [emitSocketEvent, roomId]
+    [emitSocketEvent, estimateServerNowMs, roomId]
   );
 
   const handleLocalSeek = useCallback(
@@ -329,24 +837,29 @@ function Room() {
         return;
       }
 
+      const sent = emitSocketEvent("seek", { roomId, currentTime });
+      if (!sent) {
+        return;
+      }
+
       setRoomState((prev) =>
         prev
           ? {
               ...prev,
               currentTime,
-              updatedAt: Date.now(),
+              stateCurrentTime: currentTime,
+              updatedAt: estimateServerNowMs(),
+              stateUpdatedAt: estimateServerNowMs(),
             }
           : prev
       );
-
-      emitSocketEvent("seek", { roomId, currentTime });
     },
-    [emitSocketEvent, roomId]
+    [emitSocketEvent, estimateServerNowMs, roomId]
   );
 
   const handlePlayerReady = useCallback(() => {
     if (roomStateRef.current) {
-      applySnapshotToPlayer(roomStateRef.current, true);
+      applySnapshotToPlayer(roomStateRef.current, { forceSeek: true });
     }
   }, [applySnapshotToPlayer]);
 
@@ -359,8 +872,95 @@ function Room() {
     }
   }
 
-  function handleManualSync() {
-    emitSocketEvent("syncRequest", { roomId });
+  async function handleManualSync() {
+    const socket = socketRef.current;
+
+    if (!socket) {
+      return;
+    }
+
+    if (!socket.connected) {
+      setConnectionStatus("reconnecting");
+      showInfo("Пробуємо відновити зʼєднання...");
+      socket.connect();
+      return;
+    }
+
+    await syncServerClock({ attempts: 2 });
+    socket.emit("syncRequest", { roomId, reason: "manual" });
+  }
+
+  function handleLocalVideoEnded() {
+    if (ignoreNextEventRef.current) {
+      return;
+    }
+
+    const snapshot = roomStateRef.current;
+    const itemId =
+      snapshot?.currentItem?.itemId ||
+      snapshot?.playlist?.[Number(snapshot?.currentIndex) || 0]?.itemId;
+
+    if (!itemId) {
+      return;
+    }
+
+    emitSocketEvent("videoEnded", { roomId, itemId });
+  }
+
+  async function handleAddToPlaylist(event) {
+    event.preventDefault();
+    setError("");
+
+    const rawUrl = playlistUrlDraft.trim();
+    const parsed = parseVideoUrl(rawUrl);
+
+    if (parsed.error) {
+      setError(parsed.error);
+      return;
+    }
+
+    if (playlist.length >= PLAYLIST_MAX_ITEMS) {
+      setError(`Досягнуто ліміт плейлиста: ${PLAYLIST_MAX_ITEMS} відео.`);
+      return;
+    }
+
+    emitSocketEvent("addToPlaylist", { roomId, videoUrl: rawUrl });
+    setPlaylistUrlDraft("");
+  }
+
+  function handleSelectPlaylistItem(itemId) {
+    if (!itemId) {
+      return;
+    }
+
+    emitSocketEvent("setCurrentPlaylistItem", { roomId, itemId });
+  }
+
+  function handleRemovePlaylistItem(itemId) {
+    if (!itemId) {
+      return;
+    }
+
+    emitSocketEvent("removeFromPlaylist", { roomId, itemId });
+  }
+
+  function handleNicknameSave(event) {
+    event.preventDefault();
+
+    const safeNickname = sanitizeNickname(nicknameDraft);
+
+    if (!safeNickname) {
+      setError("Нікнейм не може бути порожнім.");
+      return;
+    }
+
+    setError("");
+    setNickname(safeNickname);
+    setNicknameDraft(safeNickname);
+    window.localStorage.setItem(NICKNAME_STORAGE_KEY, safeNickname);
+
+    emitSocketEvent("joinRoom", { roomId, nickname: safeNickname });
+    showInfo("Нікнейм оновлено");
   }
 
   if (loading) {
@@ -388,9 +988,12 @@ function Room() {
   const connectionLabel =
     connectionStatus === "connected"
       ? "Підключено"
+      : connectionStatus === "reconnecting"
+        ? "Відновлення..."
       : connectionStatus === "connecting"
         ? "Підключення..."
         : "Втрачено зʼєднання";
+  const displayedUsersCount = sortedParticipants.length || usersCount;
 
   return (
     <main className="page page-room">
@@ -402,7 +1005,11 @@ function Room() {
           </div>
           <span
             className={`connection-pill ${
-              connectionStatus === "connected" ? "online" : "offline"
+              connectionStatus === "connected"
+                ? "online"
+                : connectionStatus === "reconnecting"
+                  ? "reconnecting"
+                  : "offline"
             }`}
           >
             {connectionLabel}
@@ -417,9 +1024,27 @@ function Room() {
         </div>
 
         <div className="room-stats">
-          <span>Учасників онлайн: {usersCount}</span>
+          <span>Учасників онлайн: {displayedUsersCount}</span>
           <span>Тип відео: {roomState.videoType === "youtube" ? "YouTube" : "MP4"}</span>
+          <span>
+            Трек: {playlist.length > 0 ? currentPlaylistIndex + 1 : 0}/{playlist.length}
+          </span>
         </div>
+
+        <form className="nickname-form" onSubmit={handleNicknameSave}>
+          <label htmlFor="roomNickname">Ваш нікнейм</label>
+          <div className="nickname-row">
+            <input
+              id="roomNickname"
+              type="text"
+              value={nicknameDraft}
+              onChange={(event) => setNicknameDraft(event.target.value)}
+              placeholder="Введіть свій нікнейм"
+              maxLength={MAX_NICKNAME_LENGTH}
+            />
+            <button type="submit">Оновити</button>
+          </div>
+        </form>
 
         <div className="room-actions">
           <button type="button" onClick={handleManualSync}>
@@ -428,6 +1053,87 @@ function Room() {
           <Link className="ghost-button" to="/">
             Нова кімната
           </Link>
+        </div>
+
+        <section className="playlist-panel">
+          <h2>Плейлист кімнати</h2>
+
+          <form className="playlist-form" onSubmit={handleAddToPlaylist}>
+            <label htmlFor="playlistVideoUrl">Додати відео в чергу</label>
+            <div className="playlist-form-row">
+              <input
+                id="playlistVideoUrl"
+                type="url"
+                placeholder="https://www.youtube.com/watch?v=... або https://site.com/video.mp4"
+                value={playlistUrlDraft}
+                onChange={(event) => setPlaylistUrlDraft(event.target.value)}
+                autoComplete="off"
+              />
+              <button type="submit" disabled={!playlistUrlDraft.trim()}>
+                Додати
+              </button>
+            </div>
+          </form>
+
+          {playlist.length === 0 ? (
+            <p className="playlist-empty">Плейлист поки порожній.</p>
+          ) : (
+            <ul className="playlist-list">
+              {playlist.map((item, index) => {
+                const isCurrent = currentPlaylistItem?.itemId === item.itemId;
+
+                return (
+                  <li key={item.itemId} className={isCurrent ? "is-current" : ""}>
+                    <button
+                      type="button"
+                      className="playlist-item-main"
+                      onClick={() => handleSelectPlaylistItem(item.itemId)}
+                    >
+                      <span className="playlist-item-title">
+                        {index + 1}. {item.videoType === "youtube" ? "YouTube" : "MP4"}
+                      </span>
+                      <span className="playlist-item-url">{item.videoUrl}</span>
+                      {item.addedBy ? (
+                        <span className="playlist-item-meta">Додав: {item.addedBy}</span>
+                      ) : null}
+                    </button>
+
+                    <div className="playlist-item-actions">
+                      {isCurrent ? <span className="playlist-current-badge">Зараз грає</span> : null}
+                      <button
+                        type="button"
+                        className="ghost-button playlist-remove-button"
+                        onClick={() => handleRemovePlaylistItem(item.itemId)}
+                        disabled={playlist.length <= 1}
+                      >
+                        Видалити
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </section>
+
+        <div className="participants-panel">
+          <h2>Учасники кімнати</h2>
+          {sortedParticipants.length === 0 ? (
+            <p className="participants-empty">Поки що нікого немає в кімнаті.</p>
+          ) : (
+            <ul className="participants-list">
+              {sortedParticipants.map((participant) => {
+                const isCurrentUser = participant.socketId === socketRef.current?.id;
+
+                return (
+                  <li key={participant.socketId}>
+                    <span>{participant.nickname}</span>
+                    {isCurrentUser ? <span className="participant-self">(Ви)</span> : null}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
         </div>
 
         {infoMessage ? <p className="info-message">{infoMessage}</p> : null}
@@ -444,6 +1150,7 @@ function Room() {
           onPlay={handleLocalPlay}
           onPause={handleLocalPause}
           onSeek={handleLocalSeek}
+          onEnded={handleLocalVideoEnded}
           onReady={handlePlayerReady}
           onError={setError}
         />

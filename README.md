@@ -1,6 +1,6 @@
 # Zagor Watch Party (MVP)
 
-MVP вебсервісу для синхронного перегляду одного відео кількома людьми в кімнаті.
+MVP вебсервісу для синхронного перегляду одного або кількох відео кількома людьми в кімнаті.
 Один учасник натискає `Play`, `Pause` або `Seek` і ця дія повторюється в інших учасників через Socket.IO.
 
 ## Можливості MVP
@@ -21,17 +21,40 @@ MVP вебсервісу для синхронного перегляду одн
   - `play`
   - `pause`
   - `seek`
+  - `addToPlaylist`
+  - `removeFromPlaylist`
+  - `setCurrentPlaylistItem`
+  - `videoEnded`
+  - `playlistUpdated`
+  - `playlistAdvanced`
   - `syncRequest`
   - `syncResponse`
+  - `timeSync` (оцінка offset клієнтського годинника відносно сервера)
   - `userJoined`
   - `userLeft`
 - Показ:
   - посилання на кімнату + кнопка копіювання
-  - кількість підключених користувачів
+  - список підключених учасників з нікнеймами
   - стан з’єднання Socket.IO
+- Автовідновлення після обриву мережі:
+  - автоматичний reconnect Socket.IO
+  - повторний `joinRoom` після підключення
+  - контрольний `syncRequest` після reconnection для вирівнювання стану плеєра
 - Авто-синхронізація кожні ~7 секунд для корекції дрейфу.
+- Корекція дрейфу:
+  - `hard correction` при великому розходженні позиції
+  - `soft correction` при помірному дрейфі під час відтворення
+  - cooldown між м’якими корекціями, щоб не було "смикань" плеєра
+- Періодичний перерахунок `server time offset` для стабільнішого `play/seek` на повільному інтернеті.
 - Ручна кнопка “Синхронізуватися з хостом”.
+- Плейлист у кімнаті:
+  - додавання кількох відео
+  - перемикання між відео
+  - автоперехід на наступне після завершення поточного
 - Очищення порожніх кімнат через TTL.
+- Базовий monitoring:
+  - інтеграція з Sentry для помилок backend/socket
+  - `/api/metrics` з метриками `socket errors`, `disconnect rate`, `room lifetime`
 
 ## Технологічний стек
 
@@ -41,7 +64,7 @@ MVP вебсервісу для синхронного перегляду одн
 - Reverse proxy: Nginx
 - TLS/публічний вхід (VPS): Caddy
 - Контейнеризація: Docker + Docker Compose
-- Зберігання стану: in-memory (без БД на етапі MVP)
+- Зберігання стану: Redis (персистентно, AOF у Docker)
 
 ## Структура проєкту
 
@@ -97,14 +120,32 @@ watch-party/
 - `videoUrl`
 - `videoType` (`youtube` або `mp4`)
 - `videoId` (для YouTube)
+- `playlist` (масив відео у черзі)
+- `currentIndex` (поточний елемент плейлиста)
+- `currentItem` (поточне відео)
 - `isPlaying`
 - `currentTime`
+- `stateCurrentTime` (базова позиція в момент останнього оновлення стану)
 - `updatedAt`
+- `stateUpdatedAt` (timestamp останнього оновлення playback-стану на сервері)
+- `serverNowMs` (server timestamp під час формування snapshot)
 - `usersCount`
+- `participants` (`socketId`, `nickname`, `joinedAt`)
 
 Якщо `isPlaying = true`, актуальний час при читанні стану оцінюється як:
 
-`currentTime + (Date.now() - updatedAt) / 1000`
+`stateCurrentTime + (serverNowMs - stateUpdatedAt) / 1000`
+
+На frontend ця формула рахується з поправкою на clock offset, що вимірюється через `timeSync`.
+
+## Персистентність кімнат (Redis)
+
+- Стан кімнати та учасники тепер зберігаються у Redis, а не в RAM процесу Node.js.
+- Після рестарту backend-контейнера/процесу кімнати не зникають, поки не спрацює TTL або ручне очищення.
+- У Docker Compose Redis запускається як окремий сервіс `redis` з AOF (`appendonly yes`) і volume `redis_data`.
+- Backend використовує:
+  - `REDIS_URL` (наприклад `redis://redis:6379` у Docker)
+  - `REDIS_KEY_PREFIX` (ізоляція ключів проєкту)
 
 ## HTTP API
 
@@ -114,9 +155,14 @@ Body:
 
 ```json
 {
-  "videoUrl": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+  "videoUrls": [
+    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    "https://filesamples.com/samples/video/mp4/sample_640x360.mp4"
+  ]
 }
 ```
+
+Також підтримується старий формат з одним полем `videoUrl`.
 
 Response:
 
@@ -137,12 +183,88 @@ Response:
   "videoUrl": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
   "videoType": "youtube",
   "videoId": "dQw4w9WgXcQ",
+  "playlist": [
+    {
+      "itemId": "b3d4f60f-7e85-4ff7-9f23-2af0f7a3c8de",
+      "videoUrl": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      "videoType": "youtube",
+      "videoId": "dQw4w9WgXcQ",
+      "addedAt": 1710000000100,
+      "addedBy": "Zagor"
+    }
+  ],
+  "currentIndex": 0,
+  "currentItem": {
+    "itemId": "b3d4f60f-7e85-4ff7-9f23-2af0f7a3c8de",
+    "videoUrl": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    "videoType": "youtube",
+    "videoId": "dQw4w9WgXcQ",
+    "addedAt": 1710000000100,
+    "addedBy": "Zagor"
+  },
   "isPlaying": false,
   "currentTime": 0,
+  "stateCurrentTime": 0,
   "updatedAt": 1710000000000,
-  "usersCount": 2
+  "stateUpdatedAt": 1710000000000,
+  "serverNowMs": 1710000001234,
+  "usersCount": 2,
+  "participants": [
+    {
+      "socketId": "Pj8xY3P9Dnz2X4dAAAAB",
+      "nickname": "Zagor",
+      "joinedAt": 1710000000500
+    }
+  ]
 }
 ```
+
+### `GET /api/metrics`
+
+Повертає JSON зі службовими метриками backend:
+
+- socket:
+  - `connectionsTotal`
+  - `disconnectsTotal`
+  - `errorsTotal`
+  - `handlerErrorsByEvent`
+  - `disconnectReasons`
+  - `rollingWindow.disconnectRatio` / `disconnectPercent` / `disconnectsPerMinute`
+- rooms:
+  - `createdTotal`
+  - `removedTotal`
+  - `removedByReason`
+  - `lifetimeSec` (`avg`, `min`, `max`, `last`)
+
+Якщо задано `METRICS_TOKEN`, endpoint вимагає один із варіантів авторизації:
+
+- заголовок `x-metrics-token: <token>`
+- заголовок `Authorization: Bearer <token>`
+
+## Стабільність синхронізації
+
+- При підключенні та періодично клієнт виконує `timeSync` з ack-відповіддю:
+  - клієнт відправляє `clientSentAt`
+  - сервер повертає `serverNowMs`
+  - клієнт рахує RTT і offset за midpoint-методом
+- З кількох вимірів беруться найкращі (з найменшим RTT), після чого формується зважений offset.
+- Під час `play/pause/seek/roomState/syncResponse` клієнт:
+  - оцінює очікуваний server-time для позиції відео
+  - порівнює з локальною позицією
+  - застосовує `hard` або `soft` корекцію залежно від drift.
+
+## Моніторинг і логування
+
+- Sentry:
+  - увімкніть, задавши `SENTRY_DSN` у `.env`
+  - backend відправляє в Sentry:
+    - server-side помилки HTTP/Socket
+    - `uncaughtException`
+    - `unhandledRejection`
+  - перед shutdown backend робить `flush` подій, щоб не втрачати останні помилки
+- Локальні метрики (in-memory):
+  - збираються у rolling-window (`METRICS_WINDOW_MS`, за замовчуванням 5 хв)
+  - метрики доступні через `GET /api/metrics`
 
 ## Запуск локально без Docker
 
@@ -150,6 +272,7 @@ Response:
 
 1. Скопіюйте `.env.example` у `.env`.
 2. Встановіть Node.js 20+.
+3. Встановіть і запустіть Redis локально (або підніміть Redis окремо у Docker).
 
 ### Швидкий запуск однією командою (рекомендовано)
 
@@ -165,6 +288,8 @@ npm run dev
 - backend працює на `http://localhost:4000`
 - frontend працює на `http://localhost:5173`
 - обидва процеси зупиняються через `Ctrl + C` в одному вікні терміналу
+- Redis має бути доступний за `REDIS_URL` (за замовчуванням `redis://127.0.0.1:6379`)
+- якщо Redis недоступний, backend не стартує (це очікувана поведінка для гарантії персистентності).
 
 Якщо порти зайняті після аварійного завершення (`EADDRINUSE`), використайте:
 
@@ -219,6 +344,7 @@ docker compose up --build
 Після старту відкрийте:
 
 - `http://localhost:8080` (або порт із `NGINX_PORT` у `.env`)
+- Redis піднімається автоматично як сервіс `redis` (дані в volume `redis_data`).
 
 ### 3) Запуск на VPS з HTTPS (домен)
 
@@ -241,11 +367,23 @@ docker compose -f docker-compose.vps.yml up -d --build
 PORT=4000
 CLIENT_ORIGIN=http://localhost:5173,http://localhost:8080,https://watch.hotzagor.tech
 ROOM_TTL_MINUTES=30
+PLAYLIST_MAX_ITEMS=50
+REDIS_URL=redis://127.0.0.1:6379
+REDIS_KEY_PREFIX=watchparty
 MP4_PROBE_ENABLED=true
 MP4_PROBE_TIMEOUT_MS=8000
+METRICS_WINDOW_MS=300000
+METRICS_TOKEN=
+SENTRY_DSN=
+SENTRY_ENVIRONMENT=development
+SENTRY_RELEASE=watch-party-server@local
+SENTRY_TRACES_SAMPLE_RATE=0
+SENTRY_DEBUG=false
 NGINX_PORT=8080
 DOMAIN=watch.hotzagor.tech
 ```
+
+> У Docker Compose для backend автоматично використовується `redis://redis:6379` (service-name Redis у внутрішній мережі).
 
 ## Деплой на VPS для `watch.hotzagor.tech`
 
@@ -268,9 +406,23 @@ DOMAIN=watch.hotzagor.tech
 ## Як створити кімнату
 
 1. Відкрити головну сторінку.
-2. Вставити YouTube або прямий `.mp4` URL.
-3. Натиснути “Створити кімнату”.
-4. Передати друзям URL кімнати `/room/:roomId`.
+2. Ввести свій нікнейм.
+3. Вставити одне або кілька YouTube / `.mp4` URL (кожен з нового рядка).
+4. Натиснути “Створити кімнату”.
+5. Передати друзям URL кімнати `/room/:roomId`.
+
+## Як протестувати плейлист і автоперехід
+
+1. Створіть кімнату з 2+ відео.
+2. У кімнаті перевірте, що блок “Плейлист кімнати” показує чергу.
+3. Дочекайтеся завершення поточного відео:
+   - має відбутися автоперехід на наступне.
+4. Натисніть на інше відео в плейлисті:
+   - у всіх учасників має переключитися поточний трек.
+5. Додайте нове посилання через форму “Додати відео в чергу”:
+   - новий елемент має з’явитися у всіх учасників.
+6. Видаліть елемент плейлиста:
+   - список має оновитися синхронно в усіх вкладках.
 
 ## Як протестувати синхронізацію у 2 вкладках
 
@@ -283,13 +435,24 @@ DOMAIN=watch.hotzagor.tech
    - у вкладці №2 відео має перейти на ту ж позицію.
 5. Натисніть кнопку “Синхронізуватися з хостом” у вкладці №2:
    - стан має примусово підтягнутися з backend.
+6. Перевірте reconnect:
+   - у вкладці №2 тимчасово вимкніть мережу (або перезапустіть backend), потім увімкніть назад.
+   - вкладка має перейти в стан “Відновлення...”, автоматично перепідключитись і вирівняти позицію плеєра через `syncRequest`.
 
 ## Відомі обмеження MVP
 
-- Кімнати зберігаються лише в пам’яті серверу:
-  - після рестарту backend всі кімнати зникають.
 - Немає авторизації/ролей:
   - керувати плеєром можуть всі учасники.
+- Нікнейми не унікальні:
+  - різні учасники можуть вибрати однакове ім’я.
+- Один Redis-інстанс без кластеризації:
+  - для high-availability потрібні Sentinel/Cluster і реплікація.
+- Один backend-процес Socket.IO:
+  - для горизонтального масштабування потрібен `@socket.io/redis-adapter`.
+- Метрики з `/api/metrics` зберігаються лише в RAM процесу:
+  - після рестарту backend-метрики обнуляються.
+- Автоплей наступного відео може блокуватися політиками браузера:
+  - якщо вкладка неактивна або користувач не взаємодіяв із плеєром.
 - Немає гарантії мілісекундної точності:
   - є невеликий дрейф мережі/браузера, який коригується auto-sync.
 - Підтримуються тільки YouTube IFrame API та прямі `.mp4`.
@@ -300,8 +463,8 @@ DOMAIN=watch.hotzagor.tech
 
 - Режим “керує тільки хост”.
 - Авторизація та імена учасників.
-- Персистентне зберігання кімнат у БД (Redis/PostgreSQL).
+- Історія кімнат і аналітика в PostgreSQL (поверх Redis як realtime-store).
 - Чат у кімнаті.
-- Плейлист із кількох відео.
+- Drag-and-drop сортування плейлиста.
 - Вимір та компенсація latency/ping на рівні клієнта.
 - Інтеграційні тести Socket.IO сценаріїв.

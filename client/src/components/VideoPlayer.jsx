@@ -11,6 +11,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
     onPlay,
     onPause,
     onSeek,
+    onEnded,
     onReady,
     onError,
   },
@@ -25,6 +26,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
         onPlay={onPlay}
         onPause={onPause}
         onSeek={onSeek}
+        onEnded={onEnded}
         onReady={onReady}
         onError={onError}
       />
@@ -40,6 +42,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
         onPlay={onPlay}
         onPause={onPause}
         onSeek={onSeek}
+        onEnded={onEnded}
         onReady={onReady}
         onError={onError}
       />
@@ -54,4 +57,3 @@ const VideoPlayer = forwardRef(function VideoPlayer(
 });
 
 export default VideoPlayer;
-

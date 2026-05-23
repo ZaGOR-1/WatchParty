@@ -1,7 +1,7 @@
 import { forwardRef, useImperativeHandle, useRef } from "react";
 
 const Mp4Player = forwardRef(function Mp4Player(
-  { videoUrl, ignoreEventsRef, onPlay, onPause, onSeek, onReady, onError },
+  { videoUrl, ignoreEventsRef, onPlay, onPause, onSeek, onEnded, onReady, onError },
   ref
 ) {
   const videoRef = useRef(null);
@@ -77,6 +77,14 @@ const Mp4Player = forwardRef(function Mp4Player(
     onSeek?.(videoRef.current?.currentTime || 0);
   };
 
+  const handleEnded = () => {
+    if (ignoreEventsRef.current) {
+      return;
+    }
+
+    onEnded?.();
+  };
+
   return (
     <div className="player-frame">
       <video
@@ -89,6 +97,7 @@ const Mp4Player = forwardRef(function Mp4Player(
         onPlay={handlePlay}
         onPause={handlePause}
         onSeeked={handleSeeked}
+        onEnded={handleEnded}
         onError={() => onError?.("Не вдалося відтворити MP4. Перевірте посилання.")}
       />
     </div>
@@ -96,4 +105,3 @@ const Mp4Player = forwardRef(function Mp4Player(
 });
 
 export default Mp4Player;
-

@@ -2,22 +2,74 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { parseVideoUrl } from "../utils/videoParser";
 
+const NICKNAME_STORAGE_KEY = "watchparty:nickname";
+const MAX_NICKNAME_LENGTH = 24;
+
+function sanitizeNickname(value) {
+  const trimmed = String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!trimmed) {
+    return "";
+  }
+
+  return trimmed.slice(0, MAX_NICKNAME_LENGTH);
+}
+
+function getStoredNickname() {
+  if (typeof window === "undefined") {
+    return "";
+  }
+
+  return sanitizeNickname(window.localStorage.getItem(NICKNAME_STORAGE_KEY) || "");
+}
+
 function Home() {
   const navigate = useNavigate();
-  const [videoUrl, setVideoUrl] = useState("");
+  const [nickname, setNickname] = useState(() => getStoredNickname());
+  const [videoUrlsText, setVideoUrlsText] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [errorDetails, setErrorDetails] = useState([]);
+
+  function parseVideoUrlsInput(rawInput) {
+    return String(rawInput || "")
+      .split(/\r?\n|,/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+  }
 
   async function handleCreateRoom(event) {
     event.preventDefault();
     setError("");
     setErrorDetails([]);
 
-    const parsed = parseVideoUrl(videoUrl);
-    if (parsed.error) {
-      setError(parsed.error);
+    const safeNickname = sanitizeNickname(nickname);
+    if (!safeNickname) {
+      setError("Введіть свій нікнейм перед створенням кімнати.");
       return;
+    }
+
+    const videoUrls = parseVideoUrlsInput(videoUrlsText);
+
+    if (videoUrls.length === 0) {
+      setError("Додайте хоча б одне посилання на відео.");
+      return;
+    }
+
+    if (videoUrls.length > 50) {
+      setError("Для MVP доступно максимум 50 відео у стартовому плейлисті.");
+      return;
+    }
+
+    for (const url of videoUrls) {
+      const parsed = parseVideoUrl(url);
+
+      if (parsed.error) {
+        setError(parsed.error);
+        return;
+      }
     }
 
     setIsSubmitting(true);
@@ -28,7 +80,9 @@ function Home() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ videoUrl: videoUrl.trim() }),
+        body: JSON.stringify({
+          videoUrls,
+        }),
       });
 
       let data = {};
@@ -44,6 +98,7 @@ function Home() {
         throw apiError;
       }
 
+      window.localStorage.setItem(NICKNAME_STORAGE_KEY, safeNickname);
       navigate(data.url);
     } catch (requestError) {
       setError(requestError.message || "Помилка запиту до сервера.");
@@ -59,19 +114,32 @@ function Home() {
         <p className="eyebrow">Синхронний перегляд для друзів</p>
         <h1>Zagor Watch Party</h1>
         <p className="subtitle">
-          Вставте YouTube або прямий MP4 URL, створіть кімнату й дивіться відео разом у
-          реальному часі.
+          Вставте одне або кілька YouTube/MP4 посилань, створіть кімнату й дивіться
+          відео разом у реальному часі.
         </p>
 
         <form className="create-room-form" onSubmit={handleCreateRoom}>
-          <label htmlFor="videoUrl">Посилання на відео</label>
+          <label htmlFor="nickname">Ваш нікнейм</label>
           <input
-            id="videoUrl"
-            type="url"
-            placeholder="https://www.youtube.com/watch?v=... або https://site.com/video.mp4"
-            value={videoUrl}
-            onChange={(event) => setVideoUrl(event.target.value)}
-            autoComplete="off"
+            id="nickname"
+            type="text"
+            placeholder="Наприклад: Zagor"
+            value={nickname}
+            onChange={(event) => setNickname(event.target.value)}
+            autoComplete="nickname"
+            maxLength={MAX_NICKNAME_LENGTH}
+            required
+          />
+
+          <label htmlFor="videoUrls">Посилання на відео (по одному в рядку)</label>
+          <textarea
+            id="videoUrls"
+            placeholder={
+              "https://www.youtube.com/watch?v=...\nhttps://site.com/video.mp4\nhttps://youtu.be/..."
+            }
+            value={videoUrlsText}
+            onChange={(event) => setVideoUrlsText(event.target.value)}
+            rows={4}
             required
           />
           <button type="submit" disabled={isSubmitting}>
