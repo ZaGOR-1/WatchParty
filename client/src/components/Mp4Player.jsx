@@ -49,6 +49,20 @@ const Mp4Player = forwardRef(function Mp4Player(
 
         return Number(videoRef.current.currentTime || 0);
       },
+      isPlaying: () => {
+        if (!videoRef.current) {
+          return null;
+        }
+
+        return !videoRef.current.paused && !videoRef.current.ended;
+      },
+      isReady: () => {
+        if (!videoRef.current) {
+          return false;
+        }
+
+        return videoRef.current.readyState >= 1;
+      },
     }),
     []
   );

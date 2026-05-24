@@ -373,7 +373,7 @@ io.on("connection", (socket) => {
 
   socket.on(
     "joinRoom",
-    withSocketError("joinRoom", async ({ roomId, nickname } = {}) => {
+    withSocketError("joinRoom", async ({ roomId, nickname, clientId } = {}) => {
       if (!roomId) {
         socket.emit("roomError", { message: "Не передано roomId." });
         return;
@@ -394,6 +394,7 @@ io.on("connection", (socket) => {
         const updatedRoom = await upsertParticipant(roomId, {
           socketId: socket.id,
           nickname,
+          clientId,
         });
 
         if (!updatedRoom) {
@@ -422,6 +423,7 @@ io.on("connection", (socket) => {
       const updatedRoom = await upsertParticipant(roomId, {
         socketId: socket.id,
         nickname,
+        clientId,
       });
 
       if (!updatedRoom) {

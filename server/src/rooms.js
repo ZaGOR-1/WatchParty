@@ -85,6 +85,16 @@ function normalizeSocketId(value) {
   return normalized || null;
 }
 
+function normalizeClientId(value) {
+  const normalized = String(value || "").trim();
+
+  if (!normalized) {
+    return null;
+  }
+
+  return normalized.slice(0, 128);
+}
+
 function resolveHostSocketId(participants, preferredHostSocketId) {
   const safePreferredHostSocketId = normalizeSocketId(preferredHostSocketId);
 
@@ -295,6 +305,7 @@ function parseParticipantsHash(hash) {
     participants.push({
       socketId: String(participant.socketId),
       nickname: sanitizeNickname(participant.nickname) || createGuestNickname(participant.socketId),
+      clientId: normalizeClientId(participant.clientId),
       joinedAt: Number(participant.joinedAt) || Date.now(),
     });
   }
@@ -812,7 +823,7 @@ async function advancePlaylist(roomId, { expectedItemId } = {}) {
   };
 }
 
-async function upsertParticipant(roomId, { socketId, nickname }) {
+async function upsertParticipant(roomId, { socketId, nickname, clientId }) {
   const room = await getRoom(roomId, { touchTtl: false });
 
   if (!room || !socketId) {
@@ -822,16 +833,33 @@ async function upsertParticipant(roomId, { socketId, nickname }) {
   const client = await ensureRedisConnection();
   const participantsKey = getRoomParticipantsKey(roomId);
   const safeNickname = sanitizeNickname(nickname) || createGuestNickname(socketId);
-  const existingParticipant = room.participants.find((participant) => participant.socketId === socketId);
+  const safeClientId = normalizeClientId(clientId);
+  const existingBySocket = room.participants.find((participant) => participant.socketId === socketId);
+  const existingByClientId = safeClientId
+    ? room.participants.find((participant) => participant.clientId === safeClientId)
+    : null;
+  const previousParticipant = existingBySocket || existingByClientId || null;
+  const previousHostSocketId = room.hostSocketId;
+  const previousSocketIdForSameClient =
+    existingByClientId && existingByClientId.socketId !== socketId
+      ? existingByClientId.socketId
+      : null;
 
-  const participant = existingParticipant
+  if (previousSocketIdForSameClient) {
+    await client.hDel(participantsKey, previousSocketIdForSameClient);
+  }
+
+  const participant = previousParticipant
     ? {
-        ...existingParticipant,
+        ...previousParticipant,
+        socketId,
         nickname: safeNickname,
+        clientId: safeClientId,
       }
     : {
         socketId,
         nickname: safeNickname,
+        clientId: safeClientId,
         joinedAt: Date.now(),
       };
 
@@ -842,9 +870,28 @@ async function upsertParticipant(roomId, { socketId, nickname }) {
   }
 
   room.participants = room.participants
-    .filter((item) => item.socketId !== socketId)
+    .filter((item) => {
+      if (item.socketId === socketId) {
+        return false;
+      }
+
+      if (previousSocketIdForSameClient && item.socketId === previousSocketIdForSameClient) {
+        return false;
+      }
+
+      if (safeClientId && item.clientId === safeClientId) {
+        return false;
+      }
+
+      return true;
+    })
     .concat(participant)
     .sort((left, right) => left.joinedAt - right.joinedAt);
+
+  if (previousSocketIdForSameClient && previousHostSocketId === previousSocketIdForSameClient) {
+    room.hostSocketId = socketId;
+  }
+
   room.hostSocketId = resolveHostSocketId(room.participants, room.hostSocketId);
   room.emptySince = null;
 

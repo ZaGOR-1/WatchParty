@@ -117,6 +117,23 @@ const YoutubePlayer = forwardRef(function YoutubePlayer(
 
         return Number(player.getCurrentTime() || 0);
       },
+      isPlaying: () => {
+        const player = playerRef.current;
+
+        if (!player || typeof player.getPlayerState !== "function") {
+          return null;
+        }
+
+        const state = player.getPlayerState();
+        return (
+          state === window.YT?.PlayerState?.PLAYING ||
+          state === window.YT?.PlayerState?.BUFFERING
+        );
+      },
+      isReady: () => {
+        const player = playerRef.current;
+        return Boolean(player && typeof player.getCurrentTime === "function");
+      },
     }),
     []
   );

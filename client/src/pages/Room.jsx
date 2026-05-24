@@ -4,7 +4,7 @@ import VideoPlayer from "../components/VideoPlayer";
 import { getSocket } from "../socket";
 import { parseVideoUrl } from "../utils/videoParser";
 
-const REMOTE_ACTION_LOCK_MS = 2000;
+const REMOTE_ACTION_LOCK_MS = 900;
 const AUTO_SYNC_INTERVAL_MS = 20000;
 const CLOCK_SYNC_INTERVAL_MS = 25000;
 const CLOCK_SYNC_TIMEOUT_MS = 2500;
@@ -18,6 +18,7 @@ const DRIFT_CORRECTION_COOLDOWN_MS = 4000;
 const RECONNECT_RESYNC_DELAY_MS = 500;
 const RECONNECT_RETRY_PULSE_MS = 5000;
 const NICKNAME_STORAGE_KEY = "watchparty:nickname";
+const CLIENT_ID_STORAGE_KEY = "watchparty:sessionClientId";
 const MAX_NICKNAME_LENGTH = 24;
 const PLAYLIST_MAX_ITEMS = 50;
 
@@ -39,6 +40,33 @@ function getStoredNickname() {
   }
 
   return sanitizeNickname(window.localStorage.getItem(NICKNAME_STORAGE_KEY) || "");
+}
+
+function generateClientId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+
+  return `client-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
+}
+
+function getStoredClientId() {
+  if (typeof window === "undefined") {
+    return generateClientId();
+  }
+
+  try {
+    const storedValue = String(window.sessionStorage.getItem(CLIENT_ID_STORAGE_KEY) || "").trim();
+    if (storedValue) {
+      return storedValue;
+    }
+
+    const generated = generateClientId();
+    window.sessionStorage.setItem(CLIENT_ID_STORAGE_KEY, generated);
+    return generated;
+  } catch (error) {
+    return generateClientId();
+  }
 }
 
 function formatDisconnectReason(reason) {
@@ -81,6 +109,7 @@ function Room() {
 
   const playerRef = useRef(null);
   const socketRef = useRef(null);
+  const clientIdRef = useRef(getStoredClientId());
   const roomStateRef = useRef(null);
   const nicknameRef = useRef(nickname);
   const ignoreNextEventRef = useRef(false);
@@ -384,39 +413,67 @@ function Room() {
       }
 
       const targetTime = resolveExpectedTime(snapshot);
+      const player = playerRef.current;
+      const isPlayerReady =
+        typeof player.isReady === "function" ? Boolean(player.isReady()) : true;
+
+      if (!isPlayerReady) {
+        return;
+      }
+
+      const localTime = Number(player.getCurrentTime?.() || 0);
+      const driftSec = Math.abs(localTime - targetTime);
+      const nowMs = Date.now();
+      const correctionCooldownPassed =
+        nowMs - driftCorrectionAtRef.current > DRIFT_CORRECTION_COOLDOWN_MS;
+      const shouldHardSeek = forceSeek || driftSec >= HARD_DRIFT_THRESHOLD_SEC;
+      const shouldSoftCorrect =
+        allowSoftCorrection &&
+        snapshot.isPlaying &&
+        driftSec >= SOFT_DRIFT_THRESHOLD_SEC &&
+        correctionCooldownPassed;
+      const shouldSeek = shouldHardSeek || shouldSoftCorrect;
+      const desiredIsPlaying = Boolean(snapshot.isPlaying);
+      const localIsPlaying =
+        typeof player.isPlaying === "function" ? player.isPlaying() : null;
+      const shouldTogglePlayback =
+        typeof localIsPlaying === "boolean"
+          ? localIsPlaying !== desiredIsPlaying
+          : forceSeek;
+
+      if (!shouldSeek && !shouldTogglePlayback) {
+        return;
+      }
 
       withRemoteLock(() => {
-        const player = playerRef.current;
-        const localTime = Number(player.getCurrentTime?.() || 0);
-        const driftSec = Math.abs(localTime - targetTime);
-        const nowMs = Date.now();
-        const correctionCooldownPassed =
-          nowMs - driftCorrectionAtRef.current > DRIFT_CORRECTION_COOLDOWN_MS;
-        const shouldHardSeek = forceSeek || driftSec >= HARD_DRIFT_THRESHOLD_SEC;
-        const shouldSoftCorrect =
-          allowSoftCorrection &&
-          snapshot.isPlaying &&
-          driftSec >= SOFT_DRIFT_THRESHOLD_SEC &&
-          correctionCooldownPassed;
+        const safePlayer = playerRef.current;
 
-        if (shouldHardSeek || shouldSoftCorrect) {
-          player.seekTo?.(targetTime);
+        if (!safePlayer) {
+          return;
+        }
+
+        if (shouldSeek) {
+          safePlayer.seekTo?.(targetTime);
           driftCorrectionAtRef.current = nowMs;
         }
 
-        if (snapshot.isPlaying) {
-          if (shouldHardSeek || shouldSoftCorrect) {
-            player.play?.(targetTime);
+        if (!shouldTogglePlayback) {
+          return;
+        }
+
+        if (desiredIsPlaying) {
+          if (shouldSeek) {
+            safePlayer.play?.(targetTime);
           } else {
-            player.play?.();
+            safePlayer.play?.();
           }
           return;
         }
 
-        if (shouldHardSeek || shouldSoftCorrect) {
-          player.pause?.(targetTime);
+        if (shouldSeek) {
+          safePlayer.pause?.(targetTime);
         } else {
-          player.pause?.();
+          safePlayer.pause?.();
         }
       });
     },
@@ -431,6 +488,8 @@ function Room() {
   const applyPresenceSnapshot = useCallback((payload = {}) => {
     const list = Array.isArray(payload.participants) ? payload.participants : [];
     const countFromPayload = Number(payload.usersCount);
+    const hasHostSocketId = Object.prototype.hasOwnProperty.call(payload, "hostSocketId");
+    const hasHostNickname = Object.prototype.hasOwnProperty.call(payload, "hostNickname");
 
     setParticipants(list);
     setUsersCount(Number.isFinite(countFromPayload) ? countFromPayload : list.length);
@@ -444,8 +503,8 @@ function Room() {
         ...prev,
         usersCount: Number.isFinite(countFromPayload) ? countFromPayload : list.length,
         participants: list,
-        hostSocketId: payload.hostSocketId || prev.hostSocketId || null,
-        hostNickname: payload.hostNickname || prev.hostNickname || null,
+        hostSocketId: hasHostSocketId ? payload.hostSocketId : prev.hostSocketId,
+        hostNickname: hasHostNickname ? payload.hostNickname : prev.hostNickname,
       };
     });
   }, []);
@@ -521,6 +580,7 @@ function Room() {
       socket.emit("joinRoom", {
         roomId,
         nickname: sanitizeNickname(nicknameRef.current),
+        clientId: clientIdRef.current,
       });
 
       void syncServerClock({
@@ -566,9 +626,7 @@ function Room() {
       applyRoomMetaSnapshot(snapshot);
 
       const ownParticipant = Array.isArray(snapshot.participants)
-        ? snapshot.participants.find(
-            (participant) => participant.socketId === (socket.id || selfSocketId)
-          )
+        ? snapshot.participants.find((participant) => participant.socketId === socket.id)
         : null;
 
       if (ownParticipant?.nickname) {
@@ -795,7 +853,6 @@ function Room() {
     applyRoomMetaSnapshot,
     consumeServerNowHint,
     scheduleReconnectResync,
-    selfSocketId,
     showInfo,
     syncServerClock,
     updateRoomStateFromSnapshot,
@@ -822,16 +879,21 @@ function Room() {
     return () => window.clearInterval(timer);
   }, [syncServerClock]);
 
-  const emitSocketEvent = useCallback((eventName, payload) => {
-    const socket = socketRef.current;
+  const emitSocketEvent = useCallback(
+    (eventName, payload) => {
+      const socket = socketRef.current;
 
-    if (!socket || !socket.connected) {
-      return false;
-    }
+      if (!socket || !socket.connected) {
+        setConnectionStatus("reconnecting");
+        showInfo("Немає активного зʼєднання із сервером. Спробуйте ще раз через секунду.");
+        return false;
+      }
 
-    socket.emit(eventName, payload);
-    return true;
-  }, []);
+      socket.emit(eventName, payload);
+      return true;
+    },
+    [showInfo]
+  );
   const requestSyncSnapshot = useCallback(
     (reason = "manual") => {
       const socket = socketRef.current;
@@ -1076,7 +1138,11 @@ function Room() {
     setNicknameDraft(safeNickname);
     window.localStorage.setItem(NICKNAME_STORAGE_KEY, safeNickname);
 
-    emitSocketEvent("joinRoom", { roomId, nickname: safeNickname });
+    emitSocketEvent("joinRoom", {
+      roomId,
+      nickname: safeNickname,
+      clientId: clientIdRef.current,
+    });
     showInfo("Нікнейм оновлено");
   }
 

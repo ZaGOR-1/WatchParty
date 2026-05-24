@@ -1,12 +1,20 @@
+function isYouTubeWatchHost(hostname) {
+  return hostname === "youtube.com" || hostname.endsWith(".youtube.com");
+}
+
+function isYouTubeShortHost(hostname) {
+  return hostname === "youtu.be" || hostname === "www.youtu.be";
+}
+
 function extractYouTubeVideoId(urlObject) {
   const hostname = urlObject.hostname.toLowerCase();
 
-  if (hostname === "youtu.be" || hostname === "www.youtu.be") {
+  if (isYouTubeShortHost(hostname)) {
     const shortId = urlObject.pathname.split("/").filter(Boolean)[0];
     return shortId || null;
   }
 
-  if (hostname.endsWith("youtube.com")) {
+  if (isYouTubeWatchHost(hostname)) {
     if (urlObject.pathname === "/watch") {
       return urlObject.searchParams.get("v");
     }
@@ -38,10 +46,7 @@ export function parseVideoUrl(rawUrl) {
   }
 
   const hostname = urlObject.hostname.toLowerCase();
-  const isYouTubeHost =
-    hostname === "youtu.be" ||
-    hostname === "www.youtu.be" ||
-    hostname.endsWith("youtube.com");
+  const isYouTubeHost = isYouTubeShortHost(hostname) || isYouTubeWatchHost(hostname);
 
   if (isYouTubeHost) {
     const videoId = extractYouTubeVideoId(urlObject);
