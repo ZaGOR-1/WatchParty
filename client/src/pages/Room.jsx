@@ -71,6 +71,7 @@ function Room() {
   const [roomState, setRoomState] = useState(null);
   const [usersCount, setUsersCount] = useState(0);
   const [participants, setParticipants] = useState([]);
+  const [selfSocketId, setSelfSocketId] = useState(null);
   const [nickname, setNickname] = useState(() => getStoredNickname());
   const [nicknameDraft, setNicknameDraft] = useState(() => getStoredNickname());
   const [playlistUrlDraft, setPlaylistUrlDraft] = useState("");
@@ -138,7 +139,7 @@ function Room() {
 
     return playlist[currentPlaylistIndex] || playlist[0];
   }, [currentPlaylistIndex, playlist]);
-  const ownSocketId = socketRef.current?.id || null;
+  const ownSocketId = selfSocketId;
   const hostSocketId = roomState?.hostSocketId || null;
   const hostNickname = useMemo(() => {
     if (!hostSocketId) {
@@ -514,6 +515,7 @@ function Room() {
 
       hasConnectedOnceRef.current = true;
       lastDisconnectReasonRef.current = null;
+      setSelfSocketId(socket.id || null);
       setConnectionStatus("connected");
       setError("");
       socket.emit("joinRoom", {
@@ -537,6 +539,7 @@ function Room() {
 
     const handleDisconnect = (reason) => {
       lastDisconnectReasonRef.current = reason || null;
+      setSelfSocketId(null);
       window.clearTimeout(reconnectResyncTimeoutRef.current);
 
       if (reason === "io client disconnect") {
@@ -563,7 +566,9 @@ function Room() {
       applyRoomMetaSnapshot(snapshot);
 
       const ownParticipant = Array.isArray(snapshot.participants)
-        ? snapshot.participants.find((participant) => participant.socketId === socket.id)
+        ? snapshot.participants.find(
+            (participant) => participant.socketId === (socket.id || selfSocketId)
+          )
         : null;
 
       if (ownParticipant?.nickname) {
@@ -705,6 +710,7 @@ function Room() {
     };
 
     const handleReconnect = () => {
+      setSelfSocketId(socket.id || null);
       setConnectionStatus("connected");
     };
 
@@ -789,6 +795,7 @@ function Room() {
     applyRoomMetaSnapshot,
     consumeServerNowHint,
     scheduleReconnectResync,
+    selfSocketId,
     showInfo,
     syncServerClock,
     updateRoomStateFromSnapshot,
@@ -1246,7 +1253,7 @@ function Room() {
           ) : (
             <ul className="participants-list">
               {sortedParticipants.map((participant) => {
-                const isCurrentUser = participant.socketId === socketRef.current?.id;
+                const isCurrentUser = participant.socketId === ownSocketId;
                 const isHostParticipant = participant.socketId === hostSocketId;
 
                 return (
