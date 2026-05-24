@@ -36,6 +36,7 @@ const {
   upsertParticipant,
   removeParticipant,
   clearIdleRooms,
+  setRoomControlMode,
 } = require("./rooms");
 
 const PORT = Number(process.env.PORT || 4000);
@@ -292,9 +293,82 @@ io.on("connection", (socket) => {
       io.to(currentRoomId).emit("userLeft", {
         usersCount: snapshot.usersCount,
         participants: snapshot.participants,
+        hostSocketId: snapshot.hostSocketId,
+        hostNickname: snapshot.hostNickname,
         nickname: removedParticipant?.nickname || null,
       });
     }
+  }
+
+  function getTargetRoomId(inputRoomId) {
+    return inputRoomId || socket.data.roomId || null;
+  }
+
+  async function getRoomForAction(inputRoomId) {
+    const targetRoomId = getTargetRoomId(inputRoomId);
+
+    if (!targetRoomId) {
+      socket.emit("roomError", { message: "Не передано roomId." });
+      return {
+        room: null,
+        targetRoomId: null,
+      };
+    }
+
+    const room = await getRoom(targetRoomId, { touchTtl: true });
+
+    if (!room) {
+      socket.emit("roomError", { message: "Кімнату не знайдено." });
+      return {
+        room: null,
+        targetRoomId,
+      };
+    }
+
+    return {
+      room,
+      targetRoomId,
+    };
+  }
+
+  function isHostControlledRoom(room) {
+    return String(room?.controlMode || "all") === "host";
+  }
+
+  function isSocketHost(room) {
+    return Boolean(room?.hostSocketId) && room.hostSocketId === socket.id;
+  }
+
+  function rejectHostOnlyAction(room) {
+    const hostNickname = room?.hostNickname || room?.participants?.find(
+      (participant) => participant.socketId === room.hostSocketId
+    )?.nickname;
+    const hostLabel = hostNickname ? ` (${hostNickname})` : "";
+
+    socket.emit("roomError", {
+      message: `Зараз увімкнено режим "керує тільки хост". Доступно лише хосту${hostLabel}.`,
+    });
+    socket.emit("syncResponse", {
+      ...getRoomState(room),
+      reason: "host_only_rejected",
+    });
+  }
+
+  function ensureCanControl(room) {
+    if (!room) {
+      return false;
+    }
+
+    if (!isHostControlledRoom(room)) {
+      return true;
+    }
+
+    if (isSocketHost(room)) {
+      return true;
+    }
+
+    rejectHostOnlyAction(room);
+    return false;
   }
 
   socket.on(
@@ -336,6 +410,8 @@ io.on("connection", (socket) => {
         socket.to(roomId).emit("userJoined", {
           usersCount: snapshot.usersCount,
           participants: snapshot.participants,
+          hostSocketId: snapshot.hostSocketId,
+          hostNickname: snapshot.hostNickname,
           nickname: socket.data.nickname,
         });
         return;
@@ -362,67 +438,112 @@ io.on("connection", (socket) => {
       socket.to(roomId).emit("userJoined", {
         usersCount: snapshot.usersCount,
         participants: snapshot.participants,
+        hostSocketId: snapshot.hostSocketId,
+        hostNickname: snapshot.hostNickname,
         nickname: socket.data.nickname,
       });
     })
   );
 
   socket.on(
+    "setControlMode",
+    withSocketError("setControlMode", async ({ roomId, controlMode } = {}) => {
+      const { room, targetRoomId } = await getRoomForAction(roomId);
+
+      if (!room || !targetRoomId) {
+        return;
+      }
+
+      if (!isSocketHost(room)) {
+        socket.emit("roomError", {
+          message: "Змінювати режим керування може тільки хост.",
+        });
+        return;
+      }
+
+      const safeControlMode = String(controlMode || "").trim().toLowerCase() === "host"
+        ? "host"
+        : "all";
+      const updatedRoom = await setRoomControlMode(targetRoomId, safeControlMode);
+
+      if (!updatedRoom) {
+        socket.emit("roomError", {
+          message: "Не вдалося оновити режим керування кімнатою.",
+        });
+        return;
+      }
+
+      io.to(targetRoomId).emit("roomState", getRoomState(updatedRoom));
+    })
+  );
+
+  socket.on(
     "play",
     withSocketError("play", async ({ roomId, currentTime } = {}) => {
-      // Future extension point: check host permissions when controlMode !== "all".
-      const room = await setPlaybackState(roomId, { isPlaying: true, currentTime });
+      const { room: roomBefore, targetRoomId } = await getRoomForAction(roomId);
+
+      if (!roomBefore || !targetRoomId || !ensureCanControl(roomBefore)) {
+        return;
+      }
+
+      const room = await setPlaybackState(targetRoomId, { isPlaying: true, currentTime });
 
       if (!room) {
         return;
       }
 
-      socket.to(roomId).emit("play", createPlaybackEventPayload(room));
+      socket.to(targetRoomId).emit("play", createPlaybackEventPayload(room));
     })
   );
 
   socket.on(
     "pause",
     withSocketError("pause", async ({ roomId, currentTime } = {}) => {
-      // Future extension point: check host permissions when controlMode !== "all".
-      const room = await setPlaybackState(roomId, { isPlaying: false, currentTime });
+      const { room: roomBefore, targetRoomId } = await getRoomForAction(roomId);
+
+      if (!roomBefore || !targetRoomId || !ensureCanControl(roomBefore)) {
+        return;
+      }
+
+      const room = await setPlaybackState(targetRoomId, { isPlaying: false, currentTime });
 
       if (!room) {
         return;
       }
 
-      socket.to(roomId).emit("pause", createPlaybackEventPayload(room));
+      socket.to(targetRoomId).emit("pause", createPlaybackEventPayload(room));
     })
   );
 
   socket.on(
     "seek",
     withSocketError("seek", async ({ roomId, currentTime } = {}) => {
-      // Future extension point: check host permissions when controlMode !== "all".
-      const room = await setSeekState(roomId, currentTime);
+      const { room: roomBefore, targetRoomId } = await getRoomForAction(roomId);
+
+      if (!roomBefore || !targetRoomId || !ensureCanControl(roomBefore)) {
+        return;
+      }
+
+      const room = await setSeekState(targetRoomId, currentTime);
 
       if (!room) {
         return;
       }
 
-      socket.to(roomId).emit("seek", createPlaybackEventPayload(room));
+      socket.to(targetRoomId).emit("seek", createPlaybackEventPayload(room));
     })
   );
 
   socket.on(
     "addToPlaylist",
     withSocketError("addToPlaylist", async ({ roomId, videoUrl } = {}) => {
-      const targetRoomId = roomId || socket.data.roomId;
+      const { room: roomBefore, targetRoomId } = await getRoomForAction(roomId);
 
-      if (!targetRoomId) {
-        socket.emit("roomError", { message: "Не передано roomId." });
+      if (!roomBefore || !targetRoomId) {
         return;
       }
 
-      const roomBefore = await getRoom(targetRoomId, { touchTtl: true });
-
-      if (!roomBefore) {
-        socket.emit("roomError", { message: "Кімнату не знайдено." });
+      if (!ensureCanControl(roomBefore)) {
         return;
       }
 
@@ -459,10 +580,13 @@ io.on("connection", (socket) => {
   socket.on(
     "removeFromPlaylist",
     withSocketError("removeFromPlaylist", async ({ roomId, itemId } = {}) => {
-      const targetRoomId = roomId || socket.data.roomId;
+      const { room: roomBefore, targetRoomId } = await getRoomForAction(roomId);
 
-      if (!targetRoomId) {
-        socket.emit("roomError", { message: "Не передано roomId." });
+      if (!roomBefore || !targetRoomId) {
+        return;
+      }
+
+      if (!ensureCanControl(roomBefore)) {
         return;
       }
 
@@ -498,10 +622,13 @@ io.on("connection", (socket) => {
   socket.on(
     "setCurrentPlaylistItem",
     withSocketError("setCurrentPlaylistItem", async ({ roomId, itemId } = {}) => {
-      const targetRoomId = roomId || socket.data.roomId;
+      const { room: roomBefore, targetRoomId } = await getRoomForAction(roomId);
 
-      if (!targetRoomId) {
-        socket.emit("roomError", { message: "Не передано roomId." });
+      if (!roomBefore || !targetRoomId) {
+        return;
+      }
+
+      if (!ensureCanControl(roomBefore)) {
         return;
       }
 
@@ -525,9 +652,13 @@ io.on("connection", (socket) => {
   socket.on(
     "videoEnded",
     withSocketError("videoEnded", async ({ roomId, itemId } = {}) => {
-      const targetRoomId = roomId || socket.data.roomId;
+      const { room: roomBefore, targetRoomId } = await getRoomForAction(roomId);
 
-      if (!targetRoomId) {
+      if (!roomBefore || !targetRoomId) {
+        return;
+      }
+
+      if (!ensureCanControl(roomBefore)) {
         return;
       }
 

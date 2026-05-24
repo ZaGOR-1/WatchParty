@@ -87,6 +87,7 @@ function Room() {
   const reconnectResyncTimeoutRef = useRef(null);
   const hasConnectedOnceRef = useRef(false);
   const lastDisconnectReasonRef = useRef(null);
+  const previousControlModeRef = useRef(null);
   const driftCorrectionAtRef = useRef(0);
   const serverClockRef = useRef({
     offsetMs: 0,
@@ -137,6 +138,19 @@ function Room() {
 
     return playlist[currentPlaylistIndex] || playlist[0];
   }, [currentPlaylistIndex, playlist]);
+  const ownSocketId = socketRef.current?.id || null;
+  const hostSocketId = roomState?.hostSocketId || null;
+  const hostNickname = useMemo(() => {
+    if (!hostSocketId) {
+      return roomState?.hostNickname || null;
+    }
+
+    const participant = sortedParticipants.find((entry) => entry.socketId === hostSocketId);
+    return participant?.nickname || roomState?.hostNickname || null;
+  }, [hostSocketId, roomState?.hostNickname, sortedParticipants]);
+  const isHostOnlyMode = roomState?.controlMode === "host";
+  const isHost = Boolean(ownSocketId && hostSocketId && ownSocketId === hostSocketId);
+  const canControlRoom = !isHostOnlyMode || isHost;
 
   useEffect(() => {
     roomStateRef.current = roomState;
@@ -166,6 +180,21 @@ function Room() {
     window.clearTimeout(infoTimeoutRef.current);
     infoTimeoutRef.current = window.setTimeout(() => setInfoMessage(""), 2500);
   }, []);
+
+  useEffect(() => {
+    const currentMode = roomState?.controlMode || null;
+    const previousMode = previousControlModeRef.current;
+
+    if (previousMode && currentMode && previousMode !== currentMode) {
+      showInfo(
+        currentMode === "host"
+          ? "Увімкнено режим: керує тільки хост"
+          : "Увімкнено режим: керувати можуть усі"
+      );
+    }
+
+    previousControlModeRef.current = currentMode;
+  }, [roomState?.controlMode, showInfo]);
 
   const withRemoteLock = useCallback((action) => {
     ignoreNextEventRef.current = true;
@@ -398,6 +427,27 @@ function Room() {
     setUsersCount(snapshot.usersCount || 0);
     setParticipants(Array.isArray(snapshot.participants) ? snapshot.participants : []);
   }, []);
+  const applyPresenceSnapshot = useCallback((payload = {}) => {
+    const list = Array.isArray(payload.participants) ? payload.participants : [];
+    const countFromPayload = Number(payload.usersCount);
+
+    setParticipants(list);
+    setUsersCount(Number.isFinite(countFromPayload) ? countFromPayload : list.length);
+
+    setRoomState((prev) => {
+      if (!prev) {
+        return prev;
+      }
+
+      return {
+        ...prev,
+        usersCount: Number.isFinite(countFromPayload) ? countFromPayload : list.length,
+        participants: list,
+        hostSocketId: payload.hostSocketId || prev.hostSocketId || null,
+        hostNickname: payload.hostNickname || prev.hostNickname || null,
+      };
+    });
+  }, []);
 
   const scheduleReconnectResync = useCallback(
     (socket) => {
@@ -616,21 +666,19 @@ function Room() {
       }
     };
 
-    const handleUserJoined = ({ usersCount: count, participants: list, nickname: joined }) => {
-      setUsersCount(count || 0);
-      setParticipants(Array.isArray(list) ? list : []);
+    const handleUserJoined = (payload = {}) => {
+      applyPresenceSnapshot(payload);
 
-      if (joined) {
-        showInfo(`${joined} приєднався до кімнати`);
+      if (payload.nickname) {
+        showInfo(`${payload.nickname} приєднався до кімнати`);
       }
     };
 
-    const handleUserLeft = ({ usersCount: count, participants: list, nickname: left }) => {
-      setUsersCount(count || 0);
-      setParticipants(Array.isArray(list) ? list : []);
+    const handleUserLeft = (payload = {}) => {
+      applyPresenceSnapshot(payload);
 
-      if (left) {
-        showInfo(`${left} вийшов з кімнати`);
+      if (payload.nickname) {
+        showInfo(`${payload.nickname} вийшов з кімнати`);
       }
     };
 
@@ -737,6 +785,7 @@ function Room() {
   }, [
     roomId,
     applySnapshotToPlayer,
+    applyPresenceSnapshot,
     applyRoomMetaSnapshot,
     consumeServerNowHint,
     scheduleReconnectResync,
@@ -776,10 +825,36 @@ function Room() {
     socket.emit(eventName, payload);
     return true;
   }, []);
+  const requestSyncSnapshot = useCallback(
+    (reason = "manual") => {
+      const socket = socketRef.current;
+
+      if (!socket || !socket.connected) {
+        return;
+      }
+
+      socket.emit("syncRequest", { roomId, reason });
+    },
+    [roomId]
+  );
+  const rejectLocalControlAttempt = useCallback(() => {
+    if (canControlRoom) {
+      return false;
+    }
+
+    const hostLabel = hostNickname ? ` (${hostNickname})` : "";
+    showInfo(`Зараз керувати може лише хост${hostLabel}.`);
+    requestSyncSnapshot("host_only_local_block");
+    return true;
+  }, [canControlRoom, hostNickname, requestSyncSnapshot, showInfo]);
 
   const handleLocalPlay = useCallback(
     (currentTime) => {
       if (ignoreNextEventRef.current) {
+        return;
+      }
+
+      if (rejectLocalControlAttempt()) {
         return;
       }
 
@@ -801,12 +876,16 @@ function Room() {
           : prev
       );
     },
-    [emitSocketEvent, estimateServerNowMs, roomId]
+    [emitSocketEvent, estimateServerNowMs, rejectLocalControlAttempt, roomId]
   );
 
   const handleLocalPause = useCallback(
     (currentTime) => {
       if (ignoreNextEventRef.current) {
+        return;
+      }
+
+      if (rejectLocalControlAttempt()) {
         return;
       }
 
@@ -828,12 +907,16 @@ function Room() {
           : prev
       );
     },
-    [emitSocketEvent, estimateServerNowMs, roomId]
+    [emitSocketEvent, estimateServerNowMs, rejectLocalControlAttempt, roomId]
   );
 
   const handleLocalSeek = useCallback(
     (currentTime) => {
       if (ignoreNextEventRef.current) {
+        return;
+      }
+
+      if (rejectLocalControlAttempt()) {
         return;
       }
 
@@ -854,7 +937,7 @@ function Room() {
           : prev
       );
     },
-    [emitSocketEvent, estimateServerNowMs, roomId]
+    [emitSocketEvent, estimateServerNowMs, rejectLocalControlAttempt, roomId]
   );
 
   const handlePlayerReady = useCallback(() => {
@@ -890,8 +973,23 @@ function Room() {
     socket.emit("syncRequest", { roomId, reason: "manual" });
   }
 
+  function handleToggleControlMode() {
+    if (!isHost) {
+      const hostLabel = hostNickname ? ` (${hostNickname})` : "";
+      showInfo(`Змінювати режим може лише хост${hostLabel}.`);
+      return;
+    }
+
+    const nextMode = isHostOnlyMode ? "all" : "host";
+    emitSocketEvent("setControlMode", { roomId, controlMode: nextMode });
+  }
+
   function handleLocalVideoEnded() {
     if (ignoreNextEventRef.current) {
+      return;
+    }
+
+    if (rejectLocalControlAttempt()) {
       return;
     }
 
@@ -910,6 +1008,10 @@ function Room() {
   async function handleAddToPlaylist(event) {
     event.preventDefault();
     setError("");
+
+    if (rejectLocalControlAttempt()) {
+      return;
+    }
 
     const rawUrl = playlistUrlDraft.trim();
     const parsed = parseVideoUrl(rawUrl);
@@ -933,11 +1035,19 @@ function Room() {
       return;
     }
 
+    if (rejectLocalControlAttempt()) {
+      return;
+    }
+
     emitSocketEvent("setCurrentPlaylistItem", { roomId, itemId });
   }
 
   function handleRemovePlaylistItem(itemId) {
     if (!itemId) {
+      return;
+    }
+
+    if (rejectLocalControlAttempt()) {
       return;
     }
 
@@ -1029,6 +1139,8 @@ function Room() {
           <span>
             Трек: {playlist.length > 0 ? currentPlaylistIndex + 1 : 0}/{playlist.length}
           </span>
+          <span>Режим: {isHostOnlyMode ? "Керує тільки хост" : "Керують усі"}</span>
+          <span>Хост: {hostNickname || "Ще не визначено"}</span>
         </div>
 
         <form className="nickname-form" onSubmit={handleNicknameSave}>
@@ -1050,10 +1162,19 @@ function Room() {
           <button type="button" onClick={handleManualSync}>
             Синхронізуватися з хостом
           </button>
+          <button type="button" className="ghost-button" onClick={handleToggleControlMode}>
+            {isHostOnlyMode ? "Дозволити керування всім" : "Увімкнути режим хоста"}
+          </button>
           <Link className="ghost-button" to="/">
             Нова кімната
           </Link>
         </div>
+        {isHostOnlyMode && !isHost ? (
+          <p className="control-hint">
+            Режим "керує тільки хост". Ви можете дивитися, але не керувати відтворенням і
+            плейлистом.
+          </p>
+        ) : null}
 
         <section className="playlist-panel">
           <h2>Плейлист кімнати</h2>
@@ -1068,8 +1189,9 @@ function Room() {
                 value={playlistUrlDraft}
                 onChange={(event) => setPlaylistUrlDraft(event.target.value)}
                 autoComplete="off"
+                disabled={!canControlRoom}
               />
-              <button type="submit" disabled={!playlistUrlDraft.trim()}>
+              <button type="submit" disabled={!playlistUrlDraft.trim() || !canControlRoom}>
                 Додати
               </button>
             </div>
@@ -1088,6 +1210,7 @@ function Room() {
                       type="button"
                       className="playlist-item-main"
                       onClick={() => handleSelectPlaylistItem(item.itemId)}
+                      disabled={!canControlRoom}
                     >
                       <span className="playlist-item-title">
                         {index + 1}. {item.videoType === "youtube" ? "YouTube" : "MP4"}
@@ -1104,7 +1227,7 @@ function Room() {
                         type="button"
                         className="ghost-button playlist-remove-button"
                         onClick={() => handleRemovePlaylistItem(item.itemId)}
-                        disabled={playlist.length <= 1}
+                        disabled={playlist.length <= 1 || !canControlRoom}
                       >
                         Видалити
                       </button>
@@ -1124,11 +1247,15 @@ function Room() {
             <ul className="participants-list">
               {sortedParticipants.map((participant) => {
                 const isCurrentUser = participant.socketId === socketRef.current?.id;
+                const isHostParticipant = participant.socketId === hostSocketId;
 
                 return (
-                  <li key={participant.socketId}>
+                  <li key={participant.socketId} className={isHostParticipant ? "is-host" : ""}>
                     <span>{participant.nickname}</span>
-                    {isCurrentUser ? <span className="participant-self">(Ви)</span> : null}
+                    <span className="participant-tags">
+                      {isHostParticipant ? <span className="participant-host">Хост</span> : null}
+                      {isCurrentUser ? <span className="participant-self">(Ви)</span> : null}
+                    </span>
                   </li>
                 );
               })}
@@ -1141,19 +1268,26 @@ function Room() {
       </section>
 
       <section className="panel video-panel">
-        <VideoPlayer
-          ref={playerRef}
-          videoType={roomState.videoType}
-          videoUrl={roomState.videoUrl}
-          videoId={roomState.videoId}
-          ignoreEventsRef={ignoreNextEventRef}
-          onPlay={handleLocalPlay}
-          onPause={handleLocalPause}
-          onSeek={handleLocalSeek}
-          onEnded={handleLocalVideoEnded}
-          onReady={handlePlayerReady}
-          onError={setError}
-        />
+        <div className="video-player-wrap">
+          <VideoPlayer
+            ref={playerRef}
+            videoType={roomState.videoType}
+            videoUrl={roomState.videoUrl}
+            videoId={roomState.videoId}
+            ignoreEventsRef={ignoreNextEventRef}
+            onPlay={handleLocalPlay}
+            onPause={handleLocalPause}
+            onSeek={handleLocalSeek}
+            onEnded={handleLocalVideoEnded}
+            onReady={handlePlayerReady}
+            onError={setError}
+          />
+          {isHostOnlyMode && !isHost ? (
+            <div className="video-control-lock" aria-hidden="true">
+              <span>Керування заблоковано: лише хост</span>
+            </div>
+          ) : null}
+        </div>
       </section>
     </main>
   );

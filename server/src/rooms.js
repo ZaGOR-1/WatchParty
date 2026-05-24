@@ -7,6 +7,7 @@ const MAX_NICKNAME_LENGTH = 24;
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const REDIS_KEY_PREFIX = process.env.REDIS_KEY_PREFIX || "watchparty";
 const ROOM_TTL_MINUTES = Number(process.env.ROOM_TTL_MINUTES || 30);
+const CONTROL_MODES = new Set(["all", "host"]);
 const ROOM_TTL_SECONDS =
   ROOM_TTL_MINUTES > 0 ? Math.max(60, Math.floor(ROOM_TTL_MINUTES * 60)) : 0;
 const ROOMS_INDEX_KEY = `${REDIS_KEY_PREFIX}:rooms:index`;
@@ -65,6 +66,41 @@ function normalizeVideoType(videoType, videoUrl) {
   }
 
   return "youtube";
+}
+
+function normalizeControlMode(controlMode) {
+  const safeMode = String(controlMode || "")
+    .trim()
+    .toLowerCase();
+
+  if (!CONTROL_MODES.has(safeMode)) {
+    return "all";
+  }
+
+  return safeMode;
+}
+
+function normalizeSocketId(value) {
+  const normalized = String(value || "").trim();
+  return normalized || null;
+}
+
+function resolveHostSocketId(participants, preferredHostSocketId) {
+  const safePreferredHostSocketId = normalizeSocketId(preferredHostSocketId);
+
+  if (
+    safePreferredHostSocketId &&
+    Array.isArray(participants) &&
+    participants.some((participant) => participant.socketId === safePreferredHostSocketId)
+  ) {
+    return safePreferredHostSocketId;
+  }
+
+  if (!Array.isArray(participants) || participants.length === 0) {
+    return null;
+  }
+
+  return normalizeSocketId(participants[0]?.socketId);
 }
 
 function createGuestNickname(socketId) {
@@ -227,7 +263,8 @@ function normalizeRoomMeta(room) {
     videoId: currentItem?.videoId || null,
     playlist: normalizedPlaylist,
     currentIndex,
-    controlMode: room.controlMode || "all",
+    controlMode: normalizeControlMode(room.controlMode),
+    hostSocketId: normalizeSocketId(room.hostSocketId),
     isPlaying: Boolean(room.isPlaying),
     currentTime: normalizeTime(room.currentTime),
     updatedAt,
@@ -393,6 +430,7 @@ async function buildRoomWithParticipants(roomId, { touchTtl = false } = {}) {
 
   const participantsHash = await client.hGetAll(getRoomParticipantsKey(roomId));
   const participants = parseParticipantsHash(participantsHash);
+  const hostSocketId = resolveHostSocketId(participants, roomMeta.hostSocketId);
 
   if (touchTtl && ROOM_TTL_SECONDS > 0) {
     await expireRoomKeys(roomId);
@@ -400,6 +438,7 @@ async function buildRoomWithParticipants(roomId, { touchTtl = false } = {}) {
 
   return {
     ...roomMeta,
+    hostSocketId,
     participants,
   };
 }
@@ -407,6 +446,11 @@ async function buildRoomWithParticipants(roomId, { touchTtl = false } = {}) {
 function getRoomState(room) {
   const serverNowMs = Date.now();
   const currentItem = getCurrentItem(room);
+  const participants = Array.isArray(room.participants) ? room.participants : [];
+  const hostSocketId = resolveHostSocketId(participants, room.hostSocketId);
+  const hostParticipant = hostSocketId
+    ? participants.find((participant) => participant.socketId === hostSocketId) || null
+    : null;
   const stateCurrentTime = normalizeTime(room.currentTime);
   const currentTime =
     room.isPlaying && currentItem
@@ -422,15 +466,17 @@ function getRoomState(room) {
     playlist: room.playlist || [],
     currentIndex: normalizeCurrentIndex(room.currentIndex, room.playlist?.length || 0),
     currentItem,
-    controlMode: room.controlMode,
+    controlMode: normalizeControlMode(room.controlMode),
+    hostSocketId,
+    hostNickname: hostParticipant?.nickname || null,
     isPlaying: room.isPlaying,
     currentTime,
     stateCurrentTime,
     updatedAt: room.updatedAt,
     stateUpdatedAt: room.updatedAt,
     serverNowMs,
-    usersCount: room.participants.length,
-    participants: room.participants,
+    usersCount: participants.length,
+    participants,
   };
 }
 
@@ -464,6 +510,7 @@ async function createRoom({ videoUrl, videoType, videoId }) {
       playlist: [playlistItem],
       currentIndex: 0,
       controlMode: "all",
+      hostSocketId: null,
       isPlaying: false,
       currentTime: 0,
       createdAt,
@@ -798,6 +845,7 @@ async function upsertParticipant(roomId, { socketId, nickname }) {
     .filter((item) => item.socketId !== socketId)
     .concat(participant)
     .sort((left, right) => left.joinedAt - right.joinedAt);
+  room.hostSocketId = resolveHostSocketId(room.participants, room.hostSocketId);
   room.emptySince = null;
 
   const savedRoom = await saveRoomMeta(room);
@@ -827,6 +875,7 @@ async function removeParticipant(roomId, socketId) {
   await client.hDel(getRoomParticipantsKey(roomId), socketId);
 
   room.participants = room.participants.filter((participant) => participant.socketId !== socketId);
+  room.hostSocketId = resolveHostSocketId(room.participants, room.hostSocketId);
   room.emptySince = room.participants.length === 0 ? Date.now() : null;
 
   const savedRoom = await saveRoomMeta(room);
@@ -891,6 +940,28 @@ async function clearIdleRooms(maxIdleMs) {
   };
 }
 
+async function setRoomControlMode(roomId, controlMode) {
+  const room = await getRoom(roomId, { touchTtl: false });
+
+  if (!room) {
+    return null;
+  }
+
+  room.controlMode = normalizeControlMode(controlMode);
+  room.hostSocketId = resolveHostSocketId(room.participants, room.hostSocketId);
+
+  const savedRoom = await saveRoomMeta(room);
+
+  if (!savedRoom) {
+    return null;
+  }
+
+  return {
+    ...savedRoom,
+    participants: room.participants,
+  };
+}
+
 module.exports = {
   connectRoomsStore,
   disconnectRoomsStore,
@@ -906,4 +977,5 @@ module.exports = {
   upsertParticipant,
   removeParticipant,
   clearIdleRooms,
+  setRoomControlMode,
 };
