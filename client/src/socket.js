@@ -6,8 +6,10 @@ export function getSocket() {
   if (!socket) {
     const socketUrl = import.meta.env.VITE_SOCKET_URL || undefined;
 
-    socket = io(socketUrl, {
+      socket = io(socketUrl, {
       autoConnect: false,
+      transports: ["websocket"],
+      upgrade: false,
       reconnection: true,
       reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
